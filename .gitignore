@@ -4,6 +4,9 @@
 .env.*.local
 server/.env
 
+# 所有 Markdown 文档（可能含敏感信息，不提交）
+*.md
+
 # 依赖
 node_modules/
 .pnpm-store/
