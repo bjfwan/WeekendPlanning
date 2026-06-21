@@ -6,7 +6,7 @@ import { config } from '../config.js'
  */
 
 /** 默认 AI 请求超时时间（毫秒） */
-const AI_TIMEOUT_MS = 30_000
+const AI_TIMEOUT_MS = 120_000
 
 /**
  * 创建 OpenAI 客户端
@@ -39,14 +39,16 @@ function resolveModel(overrides?: { model?: string }): string {
 /**
  * 流式生成行程文本
  * @param prompt 行程生成 Prompt
- * @param onChunk 接收文本片段的回调
+ * @param onChunk 接收文本片段的回调（实际回答内容）
  * @param overrides 用户自定义 AI 配置
+ * @param onReasoning 接收思考过程片段的回调（reasoning 模型的思考内容）
  * @returns 完整的 AI 响应文本
  */
 export async function generatePlanStream(
   prompt: string,
   onChunk: (content: string) => void,
-  overrides?: { apiUrl?: string; apiKey?: string; model?: string }
+  overrides?: { apiUrl?: string; apiKey?: string; model?: string },
+  onReasoning?: (content: string) => void
 ): Promise<string> {
   const client = createClient(overrides)
   const model = resolveModel(overrides)
@@ -67,16 +69,26 @@ export async function generatePlanStream(
           },
           { role: 'user', content: prompt }
         ],
-        temperature: 0.7
+        temperature: 0.7,
+        stream_options: { include_usage: false }
       },
       { timeout: AI_TIMEOUT_MS }
     )
 
     for await (const chunk of stream) {
-      const delta = chunk.choices?.[0]?.delta?.content
-      if (delta) {
-        fullText += delta
-        onChunk(delta)
+      const delta = chunk.choices?.[0]?.delta as
+        | { content?: string | null; reasoning_content?: string | null }
+        | undefined
+
+      // 思考过程（reasoning 模型会先输出 reasoning_content）
+      if (delta?.reasoning_content && onReasoning) {
+        onReasoning(delta.reasoning_content)
+      }
+
+      // 实际回答内容
+      if (delta?.content) {
+        fullText += delta.content
+        onChunk(delta.content)
       }
     }
 

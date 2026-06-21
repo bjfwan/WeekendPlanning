@@ -104,6 +104,11 @@ export interface SSEMeta {
   createdAt: string
 }
 
+/** SSE reasoning 事件（AI 思考过程） */
+export interface SSEReasoning {
+  content: string
+}
+
 /** SSE chunk 事件 */
 export interface SSEChunk {
   content: string

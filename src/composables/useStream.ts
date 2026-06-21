@@ -1,5 +1,5 @@
 import { ref } from 'vue'
-import type { Plan, SSEMeta, SSEChunk, SSEDone, SSEError } from '@weekend-planner/shared'
+import type { Plan, SSEMeta, SSEChunk, SSEDone, SSEError, SSEReasoning } from '@weekend-planner/shared'
 
 /** 流式状态 */
 export type StreamStatus = 'idle' | 'streaming' | 'done' | 'error'
@@ -7,6 +7,7 @@ export type StreamStatus = 'idle' | 'streaming' | 'done' | 'error'
 /** SSE 事件回调 */
 interface UseStreamCallbacks {
   onMeta?: (meta: SSEMeta) => void
+  onReasoning?: (reasoning: SSEReasoning) => void
   onChunk?: (chunk: SSEChunk) => void
   onDone?: (done: SSEDone) => void
   onError?: (error: SSEError) => void
@@ -51,6 +52,7 @@ function parseSSEBuffer(buffer: string): { events: ParsedEvent[]; remaining: str
  */
 export function useStream() {
   const content = ref<string>('')
+  const reasoning = ref<string>('')
   const plan = ref<Plan | null>(null)
   const status = ref<StreamStatus>('idle')
   const error = ref<string>('')
@@ -71,6 +73,7 @@ export function useStream() {
   ): Promise<void> {
     // 重置状态
     content.value = ''
+    reasoning.value = ''
     plan.value = null
     status.value = 'streaming'
     error.value = ''
@@ -118,6 +121,12 @@ export function useStream() {
                 meta.value = payload as SSEMeta
                 callbacks?.onMeta?.(payload as SSEMeta)
                 break
+              case 'reasoning': {
+                const reasoningChunk = payload as SSEReasoning
+                reasoning.value += reasoningChunk.content
+                callbacks?.onReasoning?.(reasoningChunk)
+                break
+              }
               case 'chunk': {
                 const chunk = payload as SSEChunk
                 content.value += chunk.content
@@ -178,6 +187,7 @@ export function useStream() {
   function reset(): void {
     cancel()
     content.value = ''
+    reasoning.value = ''
     plan.value = null
     status.value = 'idle'
     error.value = ''
@@ -186,6 +196,7 @@ export function useStream() {
 
   return {
     content,
+    reasoning,
     plan,
     status,
     error,

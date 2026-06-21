@@ -9,7 +9,7 @@ import PlanTimeline from '@/components/PlanTimeline.vue'
 import PlanChecklist from '@/components/PlanChecklist.vue'
 
 const router = useRouter()
-const { content, plan, status, error, generatePlan, retry, cancel } = usePlan()
+const { content, reasoning, plan, status, error, generatePlan, retry, cancel } = usePlan()
 
 // 当前选中的日期 tab
 const activeDay = ref(0)
@@ -26,6 +26,9 @@ const hasRequest = computed(() => planRequest.value !== null)
 // 当前行程数据
 const currentPlan = computed(() => plan.value)
 
+// 是否处于思考阶段（有思考内容但还没有正式回答内容）
+const isThinking = computed(() => reasoning.value.length > 0 && content.value.length === 0)
+
 // 当前展示的日期行程
 const currentDay = computed(() => {
   if (!currentPlan.value || !currentPlan.value.days.length) return null
@@ -33,7 +36,7 @@ const currentDay = computed(() => {
 })
 
 // 自动滚动流式内容到底部
-watch(content, async () => {
+watch([content, reasoning], async () => {
   await nextTick()
   if (streamRef.value) {
     streamRef.value.scrollTop = streamRef.value.scrollHeight
@@ -160,15 +163,28 @@ onUnmounted(() => {
                 <span class="w-3 h-3 rounded-full bg-amber animate-bounce" style="animation-delay: 150ms" />
                 <span class="w-3 h-3 rounded-full bg-mint animate-bounce" style="animation-delay: 300ms" />
               </div>
-              <span class="font-semibold text-navy">AI 正在为你规划行程...</span>
+              <span class="font-semibold text-navy">
+                {{ isThinking ? 'AI 正在思考最佳方案...' : 'AI 正在为你规划行程...' }}
+              </span>
             </div>
-            <!-- 流式文本展示区（打字机效果） -->
+            <!-- 流式文本展示区 -->
             <div
               ref="streamRef"
               class="max-h-[50vh] overflow-y-auto p-4 rounded-xl bg-cream/50 font-mono text-sm text-navy/80 whitespace-pre-wrap leading-relaxed"
             >
-              <span>{{ content }}</span>
-              <span class="inline-block w-2 h-4 bg-coral animate-pulse align-middle ml-0.5" />
+              <!-- 思考过程（dimmed） -->
+              <div v-if="reasoning" class="text-navy/40 italic mb-2">
+                <span class="inline-block w-2 h-4 bg-mint/60 animate-pulse align-middle mr-1" />
+                {{ reasoning }}
+              </div>
+              <!-- 实际回答内容 -->
+              <div v-if="content" class="text-navy/80 not-italic">
+                {{ content }}
+                <span class="inline-block w-2 h-4 bg-coral animate-pulse align-middle ml-0.5" />
+              </div>
+              <div v-if="!reasoning && !content" class="text-navy/40">
+                等待 AI 响应...
+              </div>
             </div>
           </BaseCard>
         </div>

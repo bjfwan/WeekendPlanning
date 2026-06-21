@@ -37,6 +37,7 @@ export function usePlan() {
   return {
     // 流式状态
     content: stream.content,
+    reasoning: stream.reasoning,
     plan: stream.plan,
     status: stream.status,
     error: stream.error,

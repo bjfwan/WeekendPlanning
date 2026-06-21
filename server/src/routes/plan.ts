@@ -75,7 +75,8 @@ function parsePlan(text: string, planId: string, fallback: Partial<Plan>): Plan 
 planRouter.post('/generate', async (req, res) => {
   // 标记连接是否已断开
   let closed = false
-  req.on('close', () => {
+  // 使用 res.on('close') 而非 req.on('close')，因为后者可能在请求体接收完成时就触发
+  res.on('close', () => {
     closed = true
   })
 
@@ -113,12 +114,21 @@ planRouter.post('/generate', async (req, res) => {
     // 4. 调用 AI 服务，流式输出 chunk
     let fullText = ''
     try {
-      fullText = await generatePlanStream(prompt, (content) => {
-        if (closed) return
-        sendSSE(res, 'chunk', { content })
-      }, body.userConfig)
+      fullText = await generatePlanStream(
+        prompt,
+        (content) => {
+          if (closed) return
+          sendSSE(res, 'chunk', { content })
+        },
+        body.userConfig,
+        (content) => {
+          if (closed) return
+          sendSSE(res, 'reasoning', { content })
+        }
+      )
     } catch (err) {
       const message = err instanceof Error ? err.message : 'AI 生成失败'
+      console.error('[plan/generate] AI 生成失败:', message)
       if (!closed) {
         sendSSE(res, 'error', { message })
         res.end()

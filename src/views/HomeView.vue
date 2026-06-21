@@ -8,6 +8,7 @@ import BaseButton from '@/components/BaseButton.vue'
 import BaseInput from '@/components/BaseInput.vue'
 import BaseTag from '@/components/BaseTag.vue'
 import BaseCard from '@/components/BaseCard.vue'
+import DatePicker from '@/components/DatePicker.vue'
 
 const router = useRouter()
 
@@ -84,8 +85,64 @@ function toggleTag(list: string[], label: string) {
   }
 }
 
+// 格式化日期为 YYYY-MM-DD（使用本地时区，避免 toISOString 的时区偏移问题）
+function formatDate(date: Date): string {
+  const year = date.getFullYear()
+  const month = String(date.getMonth() + 1).padStart(2, '0')
+  const day = String(date.getDate()).padStart(2, '0')
+  return `${year}-${month}-${day}`
+}
+
+// 获取今天日期对象（清零时分秒，避免时间影响日期比较）
+function getTodayDate(): Date {
+  const d = new Date()
+  d.setHours(0, 0, 0, 0)
+  return d
+}
+
+// 获取明天日期
+function getTomorrowDate(): Date {
+  const d = getTodayDate()
+  d.setDate(d.getDate() + 1)
+  return d
+}
+
+// 获取本周末（最近的周六；若今日为周六则为今天）
+function getWeekendDate(): Date {
+  const d = getTodayDate()
+  const dayOfWeek = d.getDay() // 0 = 周日, 6 = 周六
+  const daysUntilSaturday = (6 - dayOfWeek + 7) % 7
+  d.setDate(d.getDate() + daysUntilSaturday)
+  return d
+}
+
 // 今日日期，用于 date input 最小值
-const today = new Date().toISOString().split('T')[0]
+const today = formatDate(getTodayDate())
+
+// 日期快捷选项
+const quickDateOptions = [
+  { key: 'today', label: '今天', emoji: '📌' },
+  { key: 'tomorrow', label: '明天', emoji: '🌅' },
+  { key: 'weekend', label: '本周末', emoji: '🎉' }
+]
+
+// 当前选中的快捷选项（根据 form.date 自动匹配）
+const activeQuickOption = computed<string | null>(() => {
+  if (!form.date) return null
+  if (form.date === formatDate(getTodayDate())) return 'today'
+  if (form.date === formatDate(getTomorrowDate())) return 'tomorrow'
+  if (form.date === formatDate(getWeekendDate())) return 'weekend'
+  return null
+})
+
+// 点击快捷选项，填入对应日期
+function selectQuickDate(key: string) {
+  let date: Date
+  if (key === 'today') date = getTodayDate()
+  else if (key === 'tomorrow') date = getTomorrowDate()
+  else date = getWeekendDate()
+  form.date = formatDate(date)
+}
 
 // 表单校验
 function validate(): boolean {
@@ -148,14 +205,39 @@ function handleSubmit() {
               :error="errors.city"
               required
             />
-            <BaseInput
-              v-model="form.date"
-              label="出发日期"
-              type="date"
-              :min="today"
-              :error="errors.date"
-              required
-            />
+            <div class="w-full">
+              <label class="block mb-2 text-sm font-semibold text-navy">
+                出发日期
+                <span class="text-coral">*</span>
+              </label>
+              <!-- 快捷选项按钮 -->
+              <div class="flex flex-wrap gap-1.5 mb-2">
+                <button
+                  v-for="opt in quickDateOptions"
+                  :key="opt.key"
+                  type="button"
+                  @click="selectQuickDate(opt.key)"
+                  :class="[
+                    'inline-flex items-center gap-1 px-3 py-1.5 rounded-full text-xs font-medium transition-all duration-200 border-2 outline-none cursor-pointer',
+                    'focus-visible:ring-4 focus-visible:ring-amber/30',
+                    activeQuickOption === opt.key
+                      ? 'bg-amber text-navy border-amber shadow-md scale-105'
+                      : 'bg-white text-navy/70 border-navy/10 hover:border-amber/50 hover:bg-amber/5 hover:text-navy'
+                  ]"
+                >
+                  <span class="leading-none">{{ opt.emoji }}</span>
+                  <span>{{ opt.label }}</span>
+                </button>
+              </div>
+              <!-- 自定义日历选择器 -->
+              <DatePicker
+                v-model="form.date"
+                :min="today"
+                :error="errors.date"
+                placeholder="请选择出发日期"
+                required
+              />
+            </div>
           </div>
 
           <!-- 时长选择 -->
