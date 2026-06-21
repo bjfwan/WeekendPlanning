@@ -8,6 +8,9 @@ importers:
 
   .:
     dependencies:
+      '@weekend-planner/shared':
+        specifier: workspace:*
+        version: link:shared
       vue:
         specifier: ^3.5.13
         version: 3.5.38(typescript@5.7.3)

@@ -16,6 +16,7 @@
     "lint": "eslint . --ext .vue,.ts,.tsx --fix"
   },
   "dependencies": {
+    "@weekend-planner/shared": "workspace:*",
     "vue": "^3.5.13",
     "vue-router": "^4.5.0"
   },
