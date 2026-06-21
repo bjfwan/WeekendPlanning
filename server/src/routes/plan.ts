@@ -1,7 +1,7 @@
 import { Router, type Response } from 'express'
 import type { GeneratePlanRequest, Plan, WeatherInfo } from '@weekend-planner/shared'
 import { generatePlanStream } from '../services/ai.js'
-import { getWeather } from '../services/amap.js'
+import { getWeather, searchPOI } from '../services/amap.js'
 import { buildPlanPrompt } from '../services/prompt.js'
 
 export const planRouter = Router()
@@ -65,6 +65,44 @@ function parsePlan(text: string, planId: string, fallback: Partial<Plan>): Plan 
     budget: typeof obj.budget === 'number' ? obj.budget : fallback.budget ?? 0,
     checklist: obj.checklist ?? { items: [], reminders: [], mapLinks: [] },
     weather: obj.weather
+  }
+}
+
+/**
+ * 用高德 POI 搜索补充行程项的真实坐标
+ * AI 返回的坐标不准确，这里用真实坐标覆盖
+ * 分批处理（每批 3 个并发），避免触发高德 API QPS 限制
+ * 失败不影响主流程，仅保留 AI 返回的原始坐标
+ */
+async function enrichPlanItems(plan: Plan): Promise<void> {
+  for (const day of plan.days) {
+    const items = day.items
+    // 分批处理，每批 3 个并发
+    for (let i = 0; i < items.length; i += 3) {
+      const batch = items.slice(i, i + 3)
+      await Promise.all(
+        batch.map(async (item) => {
+          // 没有 location 的项跳过
+          if (!item.location) return
+          try {
+            const pois = await searchPOI(item.location, plan.city)
+            if (pois.length > 0 && pois[0].location) {
+              const parts = pois[0].location.split(',').map(Number)
+              if (parts.length === 2 && !Number.isNaN(parts[0]) && !Number.isNaN(parts[1])) {
+                item.locationLng = parts[0]
+                item.locationLat = parts[1]
+              }
+            }
+          } catch (err) {
+            // POI 搜索失败仅打印警告，不阻断主流程
+            console.warn(
+              `[enrichPlanItems] POI 搜索失败: ${item.location}`,
+              err instanceof Error ? err.message : err
+            )
+          }
+        })
+      )
+    }
   }
 }
 
@@ -144,7 +182,24 @@ planRouter.post('/generate', async (req, res) => {
         city: body.city,
         budget: body.budget
       })
-      sendSSE(res, 'done', { plan })
+
+      // 6. 用高德 POI 搜索补充真实坐标，覆盖 AI 编造的坐标
+      if (!closed) {
+        sendSSE(res, 'status', { message: '正在补充地图坐标...' })
+      }
+      try {
+        await enrichPlanItems(plan)
+      } catch (err) {
+        // 坐标补充失败不影响主流程，仅打印警告
+        console.warn(
+          '[plan/generate] 坐标补充失败:',
+          err instanceof Error ? err.message : err
+        )
+      }
+
+      if (!closed) {
+        sendSSE(res, 'done', { plan })
+      }
     } catch (err) {
       // JSON 解析失败兜底：返回原始文本作为 chunk，并发送 error 事件
       const message = err instanceof Error ? err.message : '行程解析失败'
