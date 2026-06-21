@@ -1,5 +1,5 @@
 import { Router } from 'express'
-import type { GeneratePlanRequest } from '@shared/types'
+import type { GeneratePlanRequest } from '@weekend-planner/shared'
 
 export const planRouter = Router()
 

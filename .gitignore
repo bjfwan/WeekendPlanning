@@ -52,6 +52,7 @@ coverage/
 # 临时文件
 *.tmp
 *.bak
+verceltizhi.txt
 
 # 锁文件（保留 pnpm-lock.yaml，忽略其他）
 package-lock.json
