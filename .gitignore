@@ -2,7 +2,10 @@
 .env
 .env.local
 .env.*.local
+.env.development
+.env.production
 server/.env
+server/.env.*
 
 # 所有 Markdown 文档（可能含敏感信息，不提交）
 *.md
@@ -48,3 +51,21 @@ coverage/
 # 临时文件
 *.tmp
 *.bak
+
+# 锁文件（保留 pnpm-lock.yaml，忽略其他）
+package-lock.json
+yarn.lock
+
+# 环境配置备份
+*.env.backup
+*.env.old
+
+# TRAE 配置（可能含 MCP 配置）
+.trae/
+
+# 密钥文件
+*.pem
+*.key
+*.cert
+*.p12
+*.pfx
