@@ -1,4 +1,4 @@
-import express from 'express'
+import express, { type Request, type Response, type NextFunction } from 'express'
 import cors from 'cors'
 import { config } from './config.js'
 import { planRouter } from './routes/plan.js'
@@ -10,7 +10,7 @@ app.use(cors())
 app.use(express.json({ limit: '10mb' }))
 
 // 健康检查
-app.get('/api/health', (_req, res) => {
+app.get('/api/health', (_req: Request, res: Response) => {
   res.json({
     success: true,
     data: {
@@ -25,7 +25,7 @@ app.get('/api/health', (_req, res) => {
 app.use('/api/plan', planRouter)
 
 // 错误处理
-app.use((err: Error, _req: express.Request, res: express.Response, _next: express.NextFunction) => {
+app.use((err: Error, _req: Request, res: Response, _next: NextFunction) => {
   console.error('[Server Error]', err)
   res.status(500).json({
     success: false,
