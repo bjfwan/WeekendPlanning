@@ -1,4 +1,5 @@
 import { createRouter, createWebHistory } from 'vue-router'
+import { useAuth } from '@/composables/useAuth'
 
 const router = createRouter({
   history: createWebHistory(),
@@ -14,11 +15,28 @@ const router = createRouter({
       component: () => import('@/views/PlanView.vue')
     },
     {
+      path: '/plan/:code',
+      name: 'plan-detail',
+      component: () => import('@/views/PlanDetailView.vue')
+    },
+    {
       path: '/join/:code',
       name: 'join',
       component: () => import('@/views/JoinView.vue')
+    },
+    {
+      path: '/history',
+      name: 'history',
+      component: () => import('@/views/HistoryView.vue')
     }
   ]
+})
+
+// 全局前置守卫：每次导航前确保匿名 session 存在
+// 不阻止导航，仅保证有匿名身份
+router.beforeEach(async () => {
+  const { ensureSession } = useAuth()
+  await ensureSession()
 })
 
 export default router

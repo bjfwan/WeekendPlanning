@@ -1,24 +1,40 @@
 <script setup lang="ts">
 /** 行程结果页 - 接收表单数据，流式生成并展示行程 */
-import { ref, computed, onMounted, onUnmounted, nextTick, watch } from 'vue'
+import { ref, computed, onMounted, onUnmounted, watch } from 'vue'
 import { useRouter } from 'vue-router'
 import { usePlan, planRequest } from '@/composables/usePlan'
+import { useAuth } from '@/composables/useAuth'
+import { savePlan } from '@/composables/useShare'
 import BaseButton from '@/components/BaseButton.vue'
 import BaseCard from '@/components/BaseCard.vue'
+import ShareModal from '@/components/ShareModal.vue'
 import PlanTimeline from '@/components/PlanTimeline.vue'
 import PlanChecklist from '@/components/PlanChecklist.vue'
+import StreamingPanel from '@/components/StreamingPanel.vue'
 
 const router = useRouter()
 const { content, reasoning, plan, status, error, generatePlan, retry, cancel } = usePlan()
+const { user } = useAuth()
 
 // 当前选中的日期 tab
 const activeDay = ref(0)
 
-// 分享链接复制状态
-const shareCopied = ref(false)
+// 分享错误提示
+const shareError = ref('')
+// 分享中加载状态
+const sharing = ref(false)
+// 分享弹窗显示状态
+const shareModalShow = ref(false)
+// 分享链接完整地址
+const shareUrl = ref('')
+// 分享弹窗展示的行程标题
+const sharePlanTitle = ref('')
+// 分享弹窗展示的行程城市
+const sharePlanCity = ref('')
 
-// 流式内容容器引用，用于自动滚动
-const streamRef = ref<HTMLElement | null>(null)
+// 生成完成的庆祝动画状态（done 时短暂展示 ✓ 与闪光）
+const showCelebration = ref(false)
+let celebrationTimer: ReturnType<typeof setTimeout> | null = null
 
 // 是否有有效的表单数据
 const hasRequest = computed(() => planRequest.value !== null)
@@ -26,20 +42,22 @@ const hasRequest = computed(() => planRequest.value !== null)
 // 当前行程数据
 const currentPlan = computed(() => plan.value)
 
-// 是否处于思考阶段（有思考内容但还没有正式回答内容）
-const isThinking = computed(() => reasoning.value.length > 0 && content.value.length === 0)
-
 // 当前展示的日期行程
 const currentDay = computed(() => {
   if (!currentPlan.value || !currentPlan.value.days.length) return null
   return currentPlan.value.days[activeDay.value] ?? currentPlan.value.days[0]
 })
 
-// 自动滚动流式内容到底部
-watch([content, reasoning], async () => {
-  await nextTick()
-  if (streamRef.value) {
-    streamRef.value.scrollTop = streamRef.value.scrollHeight
+// 监听生成状态：done 时触发庆祝动画，2 秒后自动收起
+watch(status, (newStatus) => {
+  if (newStatus === 'done') {
+    showCelebration.value = true
+    if (celebrationTimer) clearTimeout(celebrationTimer)
+    celebrationTimer = setTimeout(() => {
+      showCelebration.value = false
+    }, 2000)
+  } else {
+    showCelebration.value = false
   }
 })
 
@@ -61,27 +79,36 @@ function goHome() {
   router.push({ name: 'home' })
 }
 
-// 复制分享链接
+// 生成分享链接并弹出模态框
 async function handleShare() {
   if (!currentPlan.value) return
-  // 使用 planId 生成分享码（截取后 6 位）
-  const shareCode = currentPlan.value.id.replace(/^plan_/, '').slice(0, 8)
-  const shareUrl = `${window.location.origin}/join/${shareCode}`
+  shareError.value = ''
+  sharing.value = true
   try {
-    await navigator.clipboard.writeText(shareUrl)
-    shareCopied.value = true
-    setTimeout(() => (shareCopied.value = false), 2000)
-  } catch {
-    // 剪贴板不可用时回退到选中文本
-    const input = document.createElement('input')
-    input.value = shareUrl
-    document.body.appendChild(input)
-    input.select()
-    document.execCommand('copy')
-    document.body.removeChild(input)
-    shareCopied.value = true
-    setTimeout(() => (shareCopied.value = false), 2000)
+    // 调用后端保存行程，获取真实分享码
+    const userId = user.value?.id
+    if (!userId) {
+      throw new Error('用户身份未就绪，请稍后重试')
+    }
+    const { shareCode } = await savePlan(currentPlan.value, userId)
+    // 生成完整分享链接
+    shareUrl.value = `${window.location.origin}/join/${shareCode}`
+    // 记录行程信息用于弹窗展示
+    sharePlanTitle.value = currentPlan.value.title
+    sharePlanCity.value = currentPlan.value.city
+    // 弹出分享弹窗（复制操作改由弹窗内按钮处理）
+    shareModalShow.value = true
+  } catch (err) {
+    shareError.value = err instanceof Error ? err.message : '生成分享链接失败'
+    setTimeout(() => (shareError.value = ''), 3000)
+  } finally {
+    sharing.value = false
   }
+}
+
+// 关闭分享弹窗
+function closeShareModal() {
+  shareModalShow.value = false
 }
 
 // 页面挂载时自动开始生成
@@ -91,9 +118,10 @@ onMounted(() => {
   }
 })
 
-// 离开页面时取消请求
+// 离开页面时取消请求并清理定时器
 onUnmounted(() => {
   cancel()
+  if (celebrationTimer) clearTimeout(celebrationTimer)
 })
 </script>
 
@@ -147,47 +175,32 @@ onUnmounted(() => {
               v-if="status === 'done' && currentPlan"
               variant="secondary"
               size="sm"
+              :loading="sharing"
               @click="handleShare"
             >
-              {{ shareCopied ? '✓ 已复制' : '🔗 分享链接' }}
+              🔗 分享链接
+            </BaseButton>
+            <BaseButton
+              v-if="status === 'done' && currentPlan"
+              variant="ghost"
+              size="sm"
+              @click="router.push({ name: 'history' })"
+            >
+              📚 查看我的行程
             </BaseButton>
           </div>
+          <!-- 分享错误提示 -->
+          <p v-if="shareError" class="mt-2 text-right text-xs text-red-500">
+            {{ shareError }}
+          </p>
         </div>
 
         <!-- 流式生成中 -->
-        <div v-if="status === 'streaming'" class="space-y-4">
-          <BaseCard padding="lg">
-            <div class="flex items-center gap-3 mb-4">
-              <div class="flex gap-1.5">
-                <span class="w-3 h-3 rounded-full bg-coral animate-bounce" style="animation-delay: 0ms" />
-                <span class="w-3 h-3 rounded-full bg-amber animate-bounce" style="animation-delay: 150ms" />
-                <span class="w-3 h-3 rounded-full bg-mint animate-bounce" style="animation-delay: 300ms" />
-              </div>
-              <span class="font-semibold text-navy">
-                {{ isThinking ? 'AI 正在思考最佳方案...' : 'AI 正在为你规划行程...' }}
-              </span>
-            </div>
-            <!-- 流式文本展示区 -->
-            <div
-              ref="streamRef"
-              class="max-h-[50vh] overflow-y-auto p-4 rounded-xl bg-cream/50 font-mono text-sm text-navy/80 whitespace-pre-wrap leading-relaxed"
-            >
-              <!-- 思考过程（dimmed） -->
-              <div v-if="reasoning" class="text-navy/40 italic mb-2">
-                <span class="inline-block w-2 h-4 bg-mint/60 animate-pulse align-middle mr-1" />
-                {{ reasoning }}
-              </div>
-              <!-- 实际回答内容 -->
-              <div v-if="content" class="text-navy/80 not-italic">
-                {{ content }}
-                <span class="inline-block w-2 h-4 bg-coral animate-pulse align-middle ml-0.5" />
-              </div>
-              <div v-if="!reasoning && !content" class="text-navy/40">
-                等待 AI 响应...
-              </div>
-            </div>
-          </BaseCard>
-        </div>
+        <StreamingPanel
+          v-if="status === 'streaming'"
+          :content="content"
+          :reasoning="reasoning"
+        />
 
         <!-- 生成出错 -->
         <div v-else-if="status === 'error'" class="text-center py-16">
@@ -200,8 +213,29 @@ onUnmounted(() => {
         <!-- 行程展示 -->
         <div v-else-if="status === 'done' && currentPlan" class="space-y-6">
           <!-- 行程头部 -->
-          <BaseCard padding="lg" class="sm:rounded-3xl">
-            <div class="flex flex-wrap items-start justify-between gap-4">
+          <BaseCard padding="lg" class="relative overflow-hidden sm:rounded-3xl">
+            <!-- 装饰渐变背景 -->
+            <div class="pointer-events-none absolute -top-20 -right-16 w-56 h-56 rounded-full bg-coral/10 blur-3xl" />
+            <div class="pointer-events-none absolute -bottom-20 -left-16 w-48 h-48 rounded-full bg-mint/10 blur-3xl" />
+
+            <!-- 庆祝动画：✓ 徽章（done 后 2 秒消失） -->
+            <Transition name="celebrate-fade">
+              <div
+                v-if="showCelebration"
+                class="absolute top-5 right-5 z-10 w-11 h-11 grid place-items-center rounded-full bg-mint text-white shadow-lg"
+              >
+                <svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <path stroke-linecap="round" stroke-linejoin="round" stroke-width="3" d="M5 13l4 4L19 7" />
+                </svg>
+              </div>
+            </Transition>
+            <!-- 庆祝动画：标题区域闪光扫过 -->
+            <div
+              v-if="showCelebration"
+              class="pointer-events-none absolute inset-0 celebrate-sweep bg-gradient-to-r from-transparent via-white/40 to-transparent"
+            />
+
+            <div class="relative flex flex-wrap items-start justify-between gap-4">
               <div class="flex-1 min-w-0">
                 <div class="inline-flex items-center gap-1.5 px-3 py-1 rounded-full bg-coral/10 text-coral text-xs font-semibold mb-3">
                   📍 {{ currentPlan.city }}
@@ -220,14 +254,17 @@ onUnmounted(() => {
               </div>
             </div>
 
-            <!-- 天气信息 -->
-            <div v-if="currentPlan.weather" class="mt-4 flex items-center gap-3 p-3 rounded-xl bg-mint/10">
-              <span class="text-2xl">🌤️</span>
-              <div>
+            <!-- 天气信息：渐变背景 + 边框 + 更大图标 -->
+            <div
+              v-if="currentPlan.weather"
+              class="relative mt-4 flex items-center gap-4 p-4 rounded-xl bg-gradient-to-r from-mint/10 to-mint/5 border border-mint/20"
+            >
+              <span class="text-3xl shrink-0">🌤️</span>
+              <div class="min-w-0">
                 <p class="text-sm font-semibold text-navy">
                   {{ currentPlan.weather.condition }} · {{ currentPlan.weather.temperature }}
                 </p>
-                <p class="text-xs text-navy/60">{{ currentPlan.weather.suggestion }}</p>
+                <p class="text-xs text-navy/60 mt-0.5">{{ currentPlan.weather.suggestion }}</p>
               </div>
             </div>
           </BaseCard>
@@ -235,7 +272,7 @@ onUnmounted(() => {
           <!-- 每日行程 -->
           <div v-if="currentPlan.days.length">
             <!-- 日期切换 tab -->
-            <div v-if="currentPlan.days.length > 1" class="flex gap-2 mb-4 overflow-x-auto pb-1">
+            <div v-if="currentPlan.days.length > 1" class="flex gap-2 mb-4 overflow-x-auto pb-1 -mx-1 px-1">
               <button
                 v-for="(day, i) in currentPlan.days"
                 :key="i"
@@ -282,5 +319,41 @@ onUnmounted(() => {
         </div>
       </template>
     </div>
+
+    <!-- 分享成功弹窗 -->
+    <ShareModal
+      :show="shareModalShow"
+      :share-url="shareUrl"
+      :plan-title="sharePlanTitle"
+      :plan-city="sharePlanCity"
+      @close="closeShareModal"
+    />
   </div>
 </template>
+
+<style scoped>
+/* 庆祝 ✓ 徽章：弹入（带回弹）+ 淡出（带缩小） */
+.celebrate-fade-enter-active {
+  transition: opacity 0.3s ease, transform 0.4s cubic-bezier(0.34, 1.56, 0.64, 1);
+}
+.celebrate-fade-enter-from {
+  opacity: 0;
+  transform: scale(0);
+}
+.celebrate-fade-leave-active {
+  transition: opacity 0.4s ease, transform 0.4s ease;
+}
+.celebrate-fade-leave-to {
+  opacity: 0;
+  transform: scale(0.8);
+}
+
+/* 标题区域闪光扫过（done 后短暂触发） */
+.celebrate-sweep {
+  animation: celebrate-sweep 1.2s ease-out forwards;
+}
+@keyframes celebrate-sweep {
+  0% { transform: translateX(-100%); }
+  100% { transform: translateX(100%); }
+}
+</style>

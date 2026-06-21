@@ -178,6 +178,15 @@ function handleSubmit() {
     </div>
 
     <div class="relative max-w-3xl mx-auto px-4 py-10 sm:py-16">
+      <!-- 右上角：我的行程入口 -->
+      <button
+        type="button"
+        @click="router.push({ name: 'history' })"
+        class="absolute top-8 right-4 sm:top-10 sm:right-0 inline-flex items-center gap-1.5 px-4 py-2 rounded-full bg-white shadow-card text-sm font-medium text-navy/70 hover:text-coral hover:-translate-y-0.5 transition-all duration-200 cursor-pointer border border-navy/5"
+      >
+        📚 我的行程
+      </button>
+
       <!-- 头部 -->
       <header class="text-center mb-10">
         <div class="inline-flex items-center gap-2 px-4 py-1.5 rounded-full bg-white shadow-card text-sm font-medium text-coral mb-5">

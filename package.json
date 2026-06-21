@@ -16,6 +16,7 @@
     "lint": "eslint . --ext .vue,.ts,.tsx --fix"
   },
   "dependencies": {
+    "@supabase/supabase-js": "^2.108.2",
     "@weekend-planner/shared": "workspace:*",
     "vue": "^3.5.13",
     "vue-router": "^4.5.0"
