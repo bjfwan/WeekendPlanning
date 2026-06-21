@@ -1,0 +1,47 @@
+# 环境变量（含真实 Key，不提交）
+.env
+.env.local
+.env.*.local
+server/.env
+
+# 依赖
+node_modules/
+.pnpm-store/
+
+# 构建产物
+dist/
+dist-ssr/
+server/dist/
+*.local
+
+# 编辑器
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# 系统文件
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# 日志
+*.log
+npm-debug.log*
+pnpm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Vercel
+.vercel
+
+# TypeScript
+*.tsbuildinfo
+
+# 测试覆盖率
+coverage/
+
+# 临时文件
+*.tmp
+*.bak

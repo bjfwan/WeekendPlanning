@@ -1,0 +1,37 @@
+{
+  "name": "weekend-planner",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "AI 周末规划师 - TRAE AI 创造力大赛初赛 Demo",
+  "scripts": {
+    "dev": "concurrently -n web,api -c blue,green \"pnpm dev:web\" \"pnpm dev:api\"",
+    "dev:web": "vite",
+    "dev:api": "pnpm --filter server dev",
+    "build": "pnpm build:web && pnpm build:api",
+    "build:web": "vue-tsc -b && vite build",
+    "build:api": "pnpm --filter server build",
+    "preview": "vite preview",
+    "typecheck": "vue-tsc --noEmit && pnpm --filter server typecheck",
+    "lint": "eslint . --ext .vue,.ts,.tsx --fix"
+  },
+  "dependencies": {
+    "vue": "^3.5.13",
+    "vue-router": "^4.5.0"
+  },
+  "devDependencies": {
+    "@vitejs/plugin-vue": "^5.2.1",
+    "@vue/tsconfig": "^0.7.0",
+    "autoprefixer": "^10.4.20",
+    "concurrently": "^9.1.2",
+    "postcss": "^8.4.49",
+    "tailwindcss": "^3.4.17",
+    "typescript": "~5.7.2",
+    "vite": "^6.0.7",
+    "vue-tsc": "^2.2.0"
+  },
+  "engines": {
+    "node": ">=18.0.0",
+    "pnpm": ">=8.0.0"
+  }
+}
