@@ -1,6 +1,6 @@
 <script setup lang="ts">
 /** 行程详情页 - 通过分享码加载并展示已保存的行程 */
-import { ref, computed, onMounted } from 'vue'
+import { ref, computed, onMounted, onUnmounted } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import type { Plan } from '@weekend-planner/shared'
 import { fetchPlanByCode } from '@/composables/useShare'
@@ -9,6 +9,9 @@ import BaseCard from '@/components/BaseCard.vue'
 import ShareModal from '@/components/ShareModal.vue'
 import PlanTimeline from '@/components/PlanTimeline.vue'
 import PlanChecklist from '@/components/PlanChecklist.vue'
+import AmapMap from '@/components/AmapMap.vue'
+import type { MapPoint } from '@/composables/useAmap'
+import type { TransportMode } from '@shared/types'
 
 const route = useRoute()
 const router = useRouter()
@@ -39,6 +42,101 @@ const currentDay = computed(() => {
   if (!plan.value || !plan.value.days.length) return null
   return plan.value.days[activeDay.value] ?? plan.value.days[0]
 })
+
+// 地图组件实例引用（用于调用 focusPoint）
+const amapRef = ref<InstanceType<typeof AmapMap> | null>(null)
+// 时间轴容器引用（用于点击地图标记时定位卡片）
+const timelineRef = ref<HTMLDivElement | null>(null)
+
+// 当日有坐标的行程点，用于地图展示
+const mapPoints = computed<MapPoint[]>(() => {
+  if (!currentDay.value) return []
+  const result: MapPoint[] = []
+  currentDay.value.items.forEach((item) => {
+    if (item.locationLng != null && item.locationLat != null) {
+      result.push({
+        lng: item.locationLng,
+        lat: item.locationLat,
+        title: item.title,
+        address: item.address,
+        time: item.time,
+        index: result.length
+      })
+    }
+  })
+  return result
+})
+
+// 地图点对应的原始 items 索引（用于点击联动定位到正确的卡片）
+const mapPointItemIndices = computed<number[]>(() => {
+  if (!currentDay.value) return []
+  const indices: number[] = []
+  currentDay.value.items.forEach((item, i) => {
+    if (item.locationLng != null && item.locationLat != null) {
+      indices.push(i)
+    }
+  })
+  return indices
+})
+
+// 交通方式：Plan 类型不含 transport 字段，默认 mixed
+const mapTransport = computed<TransportMode>(() => 'mixed')
+
+// 窗口宽度（用于地图高度响应式切换）
+const windowWidth = ref(typeof window !== 'undefined' ? window.innerWidth : 1024)
+// 地图高度：桌面端 400px，移动端 300px
+const mapHeight = computed(() => (windowWidth.value < 640 ? '300px' : '400px'))
+
+function handleResize() {
+  windowWidth.value = window.innerWidth
+}
+
+// 当前高亮的卡片元素（用于清理样式）
+let highlightedCard: HTMLElement | null = null
+
+/**
+ * 点击地图标记时，滚动到对应的行程卡片并高亮 2 秒
+ */
+function handlePointClick(mapIndex: number) {
+  const itemIndex = mapPointItemIndices.value[mapIndex]
+  if (itemIndex == null) return
+  const container = timelineRef.value
+  if (!container) return
+  // PlanTimeline 中每个行程项包裹在 .relative.pl-8 中
+  const wrappers = container.querySelectorAll<HTMLElement>('.relative.pl-8')
+  const wrapper = wrappers[itemIndex]
+  if (!wrapper) return
+  // PlanItem 卡片根元素
+  const card = wrapper.querySelector<HTMLElement>('.bg-white.rounded-2xl.p-5')
+  if (!card) return
+
+  // 清除上一个高亮
+  clearHighlight()
+
+  // 滚动到卡片
+  card.scrollIntoView({ behavior: 'smooth', block: 'center' })
+
+  // 临时添加高亮样式（ring + scale）
+  card.style.boxShadow = '0 0 0 4px #FF6B6B, 0 8px 20px rgba(255, 107, 107, 0.3)'
+  card.style.transform = 'scale(1.03)'
+  highlightedCard = card
+
+  // 2 秒后移除高亮
+  setTimeout(() => {
+    if (highlightedCard === card) {
+      clearHighlight()
+    }
+  }, 2000)
+}
+
+/** 清除卡片高亮样式 */
+function clearHighlight() {
+  if (highlightedCard) {
+    highlightedCard.style.boxShadow = ''
+    highlightedCard.style.transform = ''
+    highlightedCard = null
+  }
+}
 
 // 切换日期 tab
 function switchDay(idx: number) {
@@ -71,6 +169,7 @@ function closeShareModal() {
 
 // 页面挂载时加载行程
 onMounted(async () => {
+  window.addEventListener('resize', handleResize)
   try {
     const data = await fetchPlanByCode(shareCode)
     plan.value = data.plan
@@ -79,6 +178,11 @@ onMounted(async () => {
   } finally {
     loading.value = false
   }
+})
+
+// 离开页面时清理事件监听
+onUnmounted(() => {
+  window.removeEventListener('resize', handleResize)
 })
 </script>
 
@@ -188,6 +292,28 @@ onMounted(async () => {
             </button>
           </div>
 
+          <!-- 当日路线地图 -->
+          <div v-if="currentDay" class="mb-4">
+            <h3 class="font-bold text-navy mb-3 flex items-center gap-2">
+              <span class="w-8 h-8 grid place-items-center rounded-lg bg-coral/15">📍</span>
+              当日路线地图
+            </h3>
+            <AmapMap
+              v-if="mapPoints.length > 0"
+              ref="amapRef"
+              :points="mapPoints"
+              :transport="mapTransport"
+              :height="mapHeight"
+              @point-click="handlePointClick"
+            />
+            <div
+              v-else
+              class="bg-white rounded-2xl p-6 shadow-card text-center text-navy/50 text-sm"
+            >
+              暂无地图数据
+            </div>
+          </div>
+
           <!-- 时间轴 -->
           <BaseCard padding="md">
             <div class="flex items-center justify-between mb-4">
@@ -196,7 +322,9 @@ onMounted(async () => {
               </h3>
               <span v-if="currentDay" class="text-sm text-navy/50">{{ currentDay.date }}</span>
             </div>
-            <PlanTimeline v-if="currentDay" :day="currentDay" />
+            <div ref="timelineRef">
+              <PlanTimeline v-if="currentDay" :day="currentDay" />
+            </div>
           </BaseCard>
         </div>
 
