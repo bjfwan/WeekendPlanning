@@ -13,16 +13,39 @@ interface Props {
   content: string
   /** 思考过程内容 */
   reasoning: string
+  /** 流式状态：'streaming' 进行中，'done' 已完成（流式结束时会强制滚动一次到底部） */
+  status?: 'streaming' | 'done'
+  /** 坐标补充进度（可选，后端推送 progress 事件时更新） */
+  enrichProgress?: { current: number; total: number; location: string } | null
 }
 
-const props = defineProps<Props>()
+const props = withDefaults(defineProps<Props>(), {
+  status: 'streaming',
+  enrichProgress: null
+})
+
+// 节流函数：限制 fn 在 delay 毫秒内只执行一次（首次触发立即执行，后续在 delay 内被忽略）
+// 用于高频 SSE chunk 触发的自动滚动，避免每个 chunk 都写 scrollTop 造成卡顿
+function throttle<T extends (...args: any[]) => void>(fn: T, delay: number): T {
+  let lastCall = 0
+  return ((...args: Parameters<T>) => {
+    const now = Date.now()
+    if (now - lastCall >= delay) {
+      lastCall = now
+      fn(...args)
+    }
+  }) as T
+}
 
 // 流式内容容器引用，用于自动滚动到底部
 const streamRef = ref<HTMLElement | null>(null)
 
+// 用户是否处于底部：只有处于底部时才自动跟随滚动
+const isAtBottom = ref(true)
+
 // 思考过程折叠状态：true=收起，false=展开
-// 默认根据当前是否已有 content 决定（生成阶段默认收起）
-const isReasoningCollapsed = ref(props.content.length > 0)
+// 同时控制 reasoning 与 content（JSON 行程数据）的折叠/展开
+const isReasoningCollapsed = ref(false)
 // 用户是否手动操作过折叠头部（一旦手动操作，本轮不再自动改变状态）
 const userToggled = ref(false)
 
@@ -35,12 +58,19 @@ const isInitializing = computed(
 const isThinking = computed(
   () => props.reasoning.length > 0 && props.content.length === 0
 )
+// 是否已完成：status === 'done' 时，隐藏思考中提示，显示"已完成"状态
+const isDone = computed(() => props.status === 'done')
 
-// 思考状态指示文本
-const reasoningStatus = computed(() => (isThinking.value ? '思考中...' : '已完成'))
+// 思考状态指示文本（含生成阶段，因为 content 也归入思考区域）
+const reasoningStatus = computed(() => {
+  if (isDone.value) return '已完成'
+  if (isThinking.value) return '思考中...'
+  if (props.content.length > 0 && props.status === 'streaming') return '生成中...'
+  return '已完成'
+})
 
-// 思考内容字数统计
-const reasoningWordCount = computed(() => props.reasoning.length)
+// 思考区域字数统计（reasoning + content 均属于思考区域）
+const reasoningWordCount = computed(() => props.reasoning.length + props.content.length)
 
 // 用户手动切换折叠状态
 function toggleReasoning() {
@@ -83,18 +113,13 @@ watch(isInitializing, (val) => {
   else stopCarousel()
 })
 
-// 监听 content 变化，自动管理思考过程折叠状态：
-// - content 从空变为有内容（进入生成阶段）：若用户未手动操作过，自动收起
-// - content 从有内容变为空（新一轮生成开始）：重置用户操作标记并展开
+// 监听 content 变化：新一轮生成开始（content 从有变为空）时重置折叠状态
+// content 与 reasoning 同属折叠区域，新一轮开始时默认展开
 watch(
   () => props.content,
   (newVal, oldVal) => {
-    const wasEmpty = !oldVal
     const isEmpty = !newVal
-    if (wasEmpty && newVal && !userToggled.value) {
-      // 进入生成阶段，自动收起思考过程
-      isReasoningCollapsed.value = true
-    } else if (oldVal && isEmpty) {
+    if (oldVal && isEmpty) {
       // 新一轮生成开始，重置状态
       userToggled.value = false
       isReasoningCollapsed.value = false
@@ -107,13 +132,71 @@ onMounted(() => {
 })
 onUnmounted(() => stopCarousel())
 
-// 自动滚动流式内容到底部
-watch([() => props.content, () => props.reasoning], async () => {
-  await nextTick()
-  if (streamRef.value) {
+// 实际执行自动滚动到底部的逻辑：仅当用户处于底部时才跟随
+function doAutoScroll() {
+  if (streamRef.value && isAtBottom.value) {
     streamRef.value.scrollTop = streamRef.value.scrollHeight
   }
+}
+
+// 节流后的自动滚动：100ms 内最多触发一次，避免高频 SSE chunk 造成卡顿
+const throttledAutoScroll = throttle(doAutoScroll, 100)
+
+// 自动滚动流式内容到底部：仅当用户处于底部时才跟随（节流 100ms）
+// 注意：节流后最后一次 chunk 可能被跳过，由下方 status 变化的 watch 兜底
+watch([() => props.content, () => props.reasoning], () => {
+  nextTick(() => {
+    throttledAutoScroll()
+  })
 })
+
+// 折叠/展开状态变化时，重新计算 isAtBottom 并必要时滚动到底部
+// 使用 v-show 切换（display: none/block），DOM 立即更新，无过渡动画
+watch(isReasoningCollapsed, () => {
+  nextTick(() => {
+    if (!streamRef.value) return
+    const { scrollTop, scrollHeight, clientHeight } = streamRef.value
+    isAtBottom.value = scrollTop + clientHeight >= scrollHeight - 30
+    // 折叠后用户仍在底部：保持滚动到底部，避免视觉跳变
+    // 折叠后用户不在底部：不强制滚动，尊重用户的滚动位置
+    if (isAtBottom.value) {
+      streamRef.value.scrollTop = streamRef.value.scrollHeight
+    }
+  })
+})
+
+// 任务 3：流式结束时强制滚动到底部
+// 节流可能导致最后一次 chunk 的滚动被跳过，流式结束（status -> 'done'）时
+// 若用户仍在底部，强制平滑滚动一次，确保最后一行可见
+watch(
+  () => props.status,
+  (newVal) => {
+    if (newVal !== 'done') return
+    nextTick(() => {
+      if (streamRef.value && isAtBottom.value) {
+        streamRef.value.scrollTo({
+          top: streamRef.value.scrollHeight,
+          behavior: 'smooth'
+        })
+      }
+    })
+  }
+)
+
+// 监听滚动事件，判断用户是否处于底部
+// 阈值 30px，允许小幅误差
+function handleScroll() {
+  if (!streamRef.value) return
+  const { scrollTop, scrollHeight, clientHeight } = streamRef.value
+  isAtBottom.value = scrollTop + clientHeight >= scrollHeight - 30
+}
+
+// 一键平滑滚动到底部并恢复自动跟随
+function scrollToBottom() {
+  if (!streamRef.value) return
+  streamRef.value.scrollTo({ top: streamRef.value.scrollHeight, behavior: 'smooth' })
+  isAtBottom.value = true
+}
 </script>
 
 <template>
@@ -122,8 +205,13 @@ watch([() => props.content, () => props.reasoning], async () => {
     <div class="relative p-[2px] rounded-3xl bg-gradient-to-br from-coral via-amber to-mint shadow-card">
       <div class="relative rounded-3xl bg-white overflow-hidden">
         <!-- 顶部循环进度条（不确定进度，循环表示"进行中"） -->
+        <!-- done 时改为满宽 mint 实色条，表示已完成 -->
         <div class="h-1 w-full bg-navy/5 overflow-hidden">
-          <div class="streaming-progress h-full bg-gradient-to-r from-coral via-amber to-mint" />
+          <div
+            v-if="!isDone"
+            class="streaming-progress h-full bg-gradient-to-r from-coral via-amber to-mint"
+          />
+          <div v-else class="h-full w-full bg-mint" />
         </div>
 
         <div class="p-6 sm:p-8">
@@ -156,63 +244,109 @@ watch([() => props.content, () => props.reasoning], async () => {
           <div v-else class="space-y-4">
             <!-- 顶部状态 -->
             <div class="flex items-center gap-3">
-              <span class="text-2xl streaming-pulse">{{ isThinking ? '🧠' : '📝' }}</span>
+              <span class="text-2xl" :class="{ 'streaming-pulse': !isDone }">
+                {{ isDone ? '✅' : (isThinking ? '🧠' : '📝') }}
+              </span>
               <span class="font-semibold text-navy">
-                {{ isThinking ? 'AI 正在思考最佳方案...' : 'AI 正在为你规划行程...' }}
+                {{ isDone ? 'AI 已完成行程规划' : (isThinking ? 'AI 正在思考最佳方案...' : 'AI 正在为你规划行程...') }}
               </span>
             </div>
 
             <!-- 流式文本展示区 -->
-            <div
-              ref="streamRef"
-              class="max-h-[50vh] overflow-y-auto p-4 rounded-xl bg-cream/50 font-mono text-sm whitespace-pre-wrap leading-relaxed"
-            >
-              <!-- 思考过程：可折叠区域 -->
-              <div v-if="reasoning" class="mb-3">
-                <!-- 折叠头部（可点击切换） -->
-                <div
-                  @click="toggleReasoning"
-                  class="flex items-center justify-between gap-2 px-3 py-2 rounded-lg bg-mint/5 hover:bg-mint/10 cursor-pointer transition-colors duration-200"
-                >
-                  <div class="flex items-center gap-2 min-w-0 text-xs">
-                    <span class="text-sm">🧠</span>
-                    <span class="font-semibold text-navy/70">AI 思考过程</span>
-                    <span class="text-navy/30">·</span>
-                    <span class="text-navy/50">{{ reasoningStatus }}</span>
-                    <span v-if="reasoningWordCount" class="text-navy/30">{{ reasoningWordCount }} 字</span>
+            <div class="relative">
+              <div
+                ref="streamRef"
+                @scroll="handleScroll"
+                class="max-h-[50vh] overflow-y-auto px-4 pb-4 rounded-xl bg-cream/50 font-mono text-sm whitespace-pre-wrap leading-relaxed"
+              >
+                <!-- 思考过程区域（reasoning + content 均可折叠） -->
+                <div v-if="reasoning || content" class="mb-3">
+                  <!-- 折叠头部（可点击切换，sticky 固定在滚动容器顶部，始终可见） -->
+                  <div
+                    @click="toggleReasoning"
+                    class="sticky top-0 z-10 -mx-4 px-4 py-3 flex items-center justify-between gap-2 bg-cream/95 backdrop-blur rounded-t-xl shadow-sm hover:bg-mint/10 cursor-pointer transition-colors duration-200"
+                  >
+                    <div class="flex items-center gap-2 min-w-0 text-xs">
+                      <span class="text-sm">🧠</span>
+                      <span class="font-semibold text-navy/70">AI 思考过程</span>
+                      <span class="text-navy/30">·</span>
+                      <span class="text-navy/50">{{ reasoningStatus }}</span>
+                      <span v-if="reasoningWordCount" class="text-navy/30">{{ reasoningWordCount }} 字</span>
+                    </div>
+                    <!-- 折叠箭头图标：展开时 ▼，收起时旋转 -90deg 变 ▶ -->
+                    <svg
+                      class="w-3.5 h-3.5 text-navy/50 shrink-0 transition-transform duration-300 ease-in-out"
+                      :class="{ '-rotate-90': isReasoningCollapsed }"
+                      fill="none"
+                      stroke="currentColor"
+                      viewBox="0 0 24 24"
+                    >
+                      <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2.5" d="M19 9l-7 7-7-7" />
+                    </svg>
                   </div>
-                  <!-- 折叠箭头图标：展开时 ▼，收起时旋转 -90deg 变 ▶ -->
+                  <!-- 折叠区域：reasoning + content 均在内，用 v-show 控制（无 max-height 裁切与过渡卡顿） -->
+                  <div v-show="!isReasoningCollapsed" class="pt-2">
+                    <!-- reasoning：AI 推理过程 -->
+                    <div v-if="reasoning" class="pl-3 border-l-2 border-mint/60 text-navy/40 italic">
+                      {{ reasoning }}
+                      <!-- 思考阶段打字机光标（done 时隐藏） -->
+                      <span
+                        v-if="isThinking && !isDone"
+                        class="inline-block w-2 h-4 bg-mint streaming-cursor align-middle ml-0.5"
+                      />
+                    </div>
+                    <!-- content（JSON 行程数据）：coral 竖线 + 标签 -->
+                    <div
+                      v-if="content"
+                      class="pt-2 mt-2 pl-3 border-l-2 border-coral text-navy/80 not-italic"
+                    >
+                      <div class="text-[10px] uppercase tracking-wider text-coral/70 font-semibold mb-1">行程数据</div>
+                      {{ content }}
+                      <!-- 生成阶段打字机光标（done 时隐藏） -->
+                      <span
+                        v-if="!isDone"
+                        class="inline-block w-2 h-4 bg-coral streaming-cursor align-middle ml-0.5"
+                      />
+                    </div>
+                  </div>
+                </div>
+              </div>
+
+              <!-- 回到底部按钮：用户上滑后显示，点击平滑滚到底部并恢复自动跟随 -->
+              <Transition name="scroll-bottom-fade">
+                <button
+                  v-if="!isAtBottom"
+                  @click="scrollToBottom"
+                  type="button"
+                  aria-label="回到底部"
+                  class="absolute bottom-3 right-3 flex items-center gap-1 px-3 py-2 rounded-full bg-coral text-white text-xs font-semibold shadow-lg hover:scale-110 hover:bg-coral/90 active:scale-95 transition-all duration-200"
+                >
                   <svg
-                    class="w-3.5 h-3.5 text-navy/50 shrink-0 transition-transform duration-300 ease-in-out"
-                    :class="{ '-rotate-90': isReasoningCollapsed }"
+                    class="w-3.5 h-3.5"
                     fill="none"
                     stroke="currentColor"
                     viewBox="0 0 24 24"
                   >
-                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2.5" d="M19 9l-7 7-7-7" />
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2.5" d="M19 14l-7 7-7-7M12 21V3" />
                   </svg>
-                </div>
-                <!-- 思考内容（max-height 过渡动画） -->
-                <div class="reasoning-collapse-wrapper" :class="{ 'collapsed': isReasoningCollapsed }">
-                  <div class="pt-2 pl-3 border-l-2 border-mint/60 text-navy/40 italic">
-                    {{ reasoning }}
-                    <!-- 思考阶段打字机光标 -->
-                    <span
-                      v-if="isThinking"
-                      class="inline-block w-2 h-4 bg-mint streaming-cursor align-middle ml-0.5"
-                    />
-                  </div>
-                </div>
+                  <span>最新</span>
+                </button>
+              </Transition>
+            </div>
+
+            <!-- 坐标补充进度：enrichPlanItems 阶段实时反馈 -->
+            <div v-if="enrichProgress" class="mt-3 p-3 rounded-xl bg-coral/10">
+              <div class="flex items-center justify-between text-xs text-navy/70 mb-2">
+                <span>正在补充地图坐标...</span>
+                <span>{{ enrichProgress.current }} / {{ enrichProgress.total }}</span>
               </div>
-              <!-- 实际内容：正常透明度 + coral 竖线 -->
-              <div
-                v-if="content"
-                class="pl-3 border-l-2 border-coral text-navy/80 not-italic"
-              >
-                {{ content }}
-                <!-- 生成阶段打字机光标 -->
-                <span class="inline-block w-2 h-4 bg-coral streaming-cursor align-middle ml-0.5" />
+              <div class="h-2 bg-white/50 rounded-full overflow-hidden">
+                <div
+                  class="h-full bg-coral rounded-full transition-all duration-300"
+                  :style="{ width: `${(enrichProgress.current / enrichProgress.total) * 100}%` }"
+                />
               </div>
+              <div class="text-xs text-navy/50 mt-1 truncate">📍 {{ enrichProgress.location }}</div>
             </div>
           </div>
         </div>
@@ -278,18 +412,6 @@ watch([() => props.content, () => props.reasoning], async () => {
   50%, 100% { opacity: 0; }
 }
 
-/* 思考过程折叠/展开动画：通过 max-height + opacity 过渡实现 */
-.reasoning-collapse-wrapper {
-  max-height: 3000px;
-  opacity: 1;
-  overflow: hidden;
-  transition: max-height 0.3s ease-in-out, opacity 0.3s ease-in-out;
-}
-.reasoning-collapse-wrapper.collapsed {
-  max-height: 0;
-  opacity: 0;
-}
-
 /* 轮播提示文字淡入淡出 */
 .hint-fade-enter-active,
 .hint-fade-leave-active {
@@ -298,6 +420,17 @@ watch([() => props.content, () => props.reasoning], async () => {
 .hint-fade-enter-from,
 .hint-fade-leave-to {
   opacity: 0;
+}
+
+/* 回到底部按钮淡入淡出 + 轻微上移 */
+.scroll-bottom-fade-enter-active,
+.scroll-bottom-fade-leave-active {
+  transition: opacity 0.25s ease, transform 0.25s ease;
+}
+.scroll-bottom-fade-enter-from,
+.scroll-bottom-fade-leave-to {
+  opacity: 0;
+  transform: translateY(8px);
 }
 
 /* 移动端：减小光环尺寸与模糊半径，降低渲染压力 */

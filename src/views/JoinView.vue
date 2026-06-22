@@ -2,15 +2,23 @@
 /** 多人协同加入页 - 通过分享码加入行程，实时同步成员 */
 import { ref, reactive, onMounted, onUnmounted } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
-import type { Plan, PlanPreferenceRecord } from '@weekend-planner/shared'
+import type {
+  Plan,
+  PlanPreferenceRecord,
+  MultiUser,
+  GeneratePlanRequest,
+  PlanDuration
+} from '@weekend-planner/shared'
 import BaseButton from '@/components/BaseButton.vue'
 import BaseInput from '@/components/BaseInput.vue'
 import BaseTag from '@/components/BaseTag.vue'
 import BaseCard from '@/components/BaseCard.vue'
 import { useAuth } from '@/composables/useAuth'
+import { usePlan, planRequest } from '@/composables/usePlan'
 import {
   fetchPlanByCode,
   fetchMembers,
+  fetchMyPlans,
   joinPlan,
   subscribeMembers
 } from '@/composables/useShare'
@@ -31,6 +39,10 @@ const submitted = ref(false)
 const members = ref<PlanPreferenceRecord[]>([])
 // 行程信息
 const plan = ref<Plan | null>(null)
+// 行程 ID（用于判断创建者）
+const planId = ref('')
+// 当前用户是否为创建者
+const isCreator = ref(false)
 // 加载状态
 const loading = ref(true)
 // 错误提示（拉取行程失败等）
@@ -39,6 +51,10 @@ const loadError = ref('')
 const joining = ref(false)
 // 提交错误提示
 const joinError = ref('')
+// 重新生成中状态
+const regenerating = ref(false)
+// 重新生成错误提示
+const regenerateError = ref('')
 
 // Realtime 订阅取消函数
 let unsubscribe: (() => void) | null = null
@@ -90,16 +106,74 @@ async function handleJoin() {
   }
 }
 
+/**
+ * 基于成员偏好重新生成行程
+ * 将成员列表转换为 multiUsers，结合原 plan 参数调用生成
+ */
+async function handleRegenerate() {
+  if (!plan.value) return
+  regenerating.value = true
+  regenerateError.value = ''
+  try {
+    // 从成员列表转换为 multiUsers 数组
+    const multiUsers: MultiUser[] = members.value.map((m) => ({
+      nickname: m.nickname,
+      preferences: m.preferences
+    }))
+
+    // 优先使用原始请求参数（同一会话中仍保留），否则从 plan 数据重建
+    let request: GeneratePlanRequest
+    if (planRequest.value) {
+      request = { ...planRequest.value, multiUsers }
+    } else {
+      const daysLen = plan.value.days.length
+      const duration: PlanDuration =
+        daysLen >= 3 ? '3-day' : daysLen === 2 ? '2-day' : '1-day'
+      request = {
+        city: plan.value.city,
+        date: plan.value.days[0]?.date || '',
+        duration,
+        budget: plan.value.budget,
+        people: 1,
+        mood: [],
+        interests: [],
+        transport: plan.value.transport ?? 'mixed',
+        multiUsers
+      }
+    }
+
+    // 写入共享 planRequest，跳转后 PlanView 会自动调用 generatePlan
+    planRequest.value = request
+    router.push({ name: 'plan' })
+  } catch (err) {
+    regenerateError.value =
+      err instanceof Error ? err.message : '重新生成失败，请稍后重试'
+  } finally {
+    regenerating.value = false
+  }
+}
+
 // 页面挂载：恢复 session 后拉取行程与成员，并订阅实时更新
 onMounted(async () => {
   await ensureSession()
   try {
     const data = await fetchPlanByCode(shareCode)
     plan.value = data.plan
+    planId.value = data.planId
     // 拉取已加入成员
     members.value = await fetchMembers(shareCode)
+    // 判断当前用户是否为创建者：查询用户的历史行程，匹配 planId
+    const userId = user.value?.id
+    if (userId) {
+      try {
+        const myPlans = await fetchMyPlans(userId)
+        isCreator.value = myPlans.some((p) => p.id === planId.value)
+      } catch {
+        // 查询失败默认非创建者
+      }
+    }
     // 订阅 plan_preferences 表的实时新增
-    unsubscribe = subscribeMembers(shareCode, (member) => {
+    unsubscribe = subscribeMembers(shareCode, data.planId, (member) => {
       // 避免重复添加同一成员
       if (members.value.some((m) => m.id === member.id)) return
       members.value.push(member)
@@ -169,12 +243,73 @@ onUnmounted(() => {
         </div>
       </BaseCard>
 
-      <!-- 已加入状态 -->
-      <BaseCard v-if="!loading && !loadError && submitted" padding="lg" class="text-center">
+      <!-- 创建者状态：显示成员列表与重新生成按钮 -->
+      <BaseCard v-if="!loading && !loadError && isCreator" padding="lg" class="text-center">
+        <div class="text-5xl mb-3">👑</div>
+        <h2 class="text-lg font-bold text-navy mb-2">你是行程创建者</h2>
+        <p class="text-sm text-navy/60 mb-4">
+          收集完成员偏好后，<br />可基于大家的偏好重新生成行程
+        </p>
+
+        <!-- 已加入成员列表 -->
+        <div v-if="members.length" class="mt-4 pt-4 border-t border-navy/5 text-left">
+          <p class="text-xs font-semibold text-navy/50 mb-2">已加入成员（{{ members.length }}）</p>
+          <div class="space-y-2">
+            <div
+              v-for="m in members"
+              :key="m.id"
+              class="flex items-center gap-2 p-2 rounded-lg bg-cream/50"
+            >
+              <span class="w-8 h-8 grid place-items-center rounded-full bg-coral text-white text-sm font-bold">
+                {{ m.nickname.charAt(0).toUpperCase() }}
+              </span>
+              <div class="flex-1 min-w-0">
+                <p class="text-sm font-medium text-navy truncate">{{ m.nickname }}</p>
+                <div v-if="m.preferences.length" class="flex flex-wrap gap-1 mt-0.5">
+                  <span
+                    v-for="p in m.preferences.slice(0, 3)"
+                    :key="p"
+                    class="text-xs px-1.5 py-0.5 rounded bg-navy/5 text-navy/60"
+                  >
+                    {{ p }}
+                  </span>
+                  <span v-if="m.preferences.length > 3" class="text-xs text-navy/40">
+                    +{{ m.preferences.length - 3 }}
+                  </span>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <!-- 暂无成员提示 -->
+        <p v-else class="text-sm text-navy/40 mt-2">暂无成员加入，等待成员通过分享链接加入...</p>
+
+        <!-- 重新生成错误提示 -->
+        <p v-if="regenerateError" class="text-sm text-red-500 mt-3">{{ regenerateError }}</p>
+
+        <div class="mt-6 space-y-2">
+          <BaseButton
+            size="lg"
+            class="w-full"
+            :loading="regenerating"
+            :disabled="!members.length"
+            @click="handleRegenerate"
+          >
+            🔄 基于成员偏好重新生成
+          </BaseButton>
+          <BaseButton variant="ghost" size="sm" @click="router.push({ name: 'home' })">
+            返回首页
+          </BaseButton>
+        </div>
+      </BaseCard>
+
+      <!-- 已加入状态（非创建者） -->
+      <BaseCard v-else-if="!loading && !loadError && submitted" padding="lg" class="text-center">
         <div class="text-5xl mb-3">🎉</div>
         <h2 class="text-lg font-bold text-navy mb-2">加入成功！</h2>
         <p class="text-sm text-navy/60 mb-4">
-          你的偏好已同步给创建者，<br />等待行程生成中...
+          你的偏好已同步给创建者，<br />等待创建者基于你的偏好重新生成行程
         </p>
 
         <!-- 已加入成员列表 -->

@@ -5,7 +5,7 @@
  * - 提供 useAmap() composable 供组件使用
  */
 import { ref, shallowRef } from 'vue'
-import type { TransportMode } from '@shared/types'
+import type { TransportMode } from '@weekend-planner/shared'
 
 /** 地图上的 POI 点 */
 export interface MapPoint {

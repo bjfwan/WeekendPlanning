@@ -1,9 +1,29 @@
 import { Router } from 'express'
 import { randomBytes } from 'crypto'
-import type { Plan, PlanPreferenceRecord, PlanRecord } from '@weekend-planner/shared'
+import type {
+  GeneratePlanRequest,
+  Plan,
+  PlanDuration,
+  PlanPreferenceRecord,
+  PlanRecord
+} from '@weekend-planner/shared'
 import { supabaseAdmin } from '../lib/supabaseAdmin.js'
+import { optionalAuth } from '../middleware/auth.js'
+
+// 补充 Express Request.user 类型声明
+// auth.ts 中已有同名声明（declare module 'express'），但 Router handler 的 Request
+// 类型实际来自 express-serve-static-core，这里补充该模块的声明确保 req.user 可用
+declare module 'express-serve-static-core' {
+  interface Request {
+    user?: { id: string } | null
+  }
+}
 
 export const shareRouter = Router()
+
+// 防御性挂载可选 JWT 校验中间件：app.ts 已挂载一次，这里再挂载确保路由自洽
+// 校验成功后 req.user.id 为可信用户 id，路由优先使用它避免 userId 伪造越权
+shareRouter.use(optionalAuth)
 
 const BASE62_CHARS = '0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz'
 
@@ -20,17 +40,41 @@ function generateShareCode(length = 8): string {
 }
 
 /**
+ * 根据 plan.days 长度推断行程时长（request 字段缺失时的兜底方案）
+ */
+function inferDuration(dayCount: number): PlanDuration {
+  if (dayCount >= 3) return '3-day'
+  if (dayCount === 2) return '2-day'
+  if (dayCount === 1) return '1-day'
+  return 'half-day'
+}
+
+/**
  * POST /api/plan/save
  * 保存行程并生成分享码
  */
 shareRouter.post('/save', async (req, res) => {
   try {
-    const { plan, userId } = req.body as { plan: Plan; userId: string }
+    const { plan, request, userId: bodyUserId } = req.body as {
+      plan: Plan
+      request?: GeneratePlanRequest
+      userId?: string
+    }
+    // 优先使用 JWT 校验后的可信用户 id，未登录时回退到 body.userId 保持兼容
+    const userId = req.user?.id || bodyUserId
 
     if (!plan || !userId) {
       res.status(400).json({ success: false, error: '缺少 plan 或 userId' })
       return
     }
+
+    // 回填生成请求中的字段（Plan 类型本身不包含 duration/people/mood/interests）
+    // request 缺失时从 plan 对象推断兜底值
+    const duration: PlanDuration = request?.duration || inferDuration(plan.days.length)
+    const people = request?.people ?? 0
+    const mood = request?.mood ?? []
+    const interests = request?.interests ?? []
+    const transport = request?.transport || plan.transport || ''
 
     // 生成分享码，冲突时重试（最多 3 次）
     let shareCode = ''
@@ -44,12 +88,12 @@ shareRouter.post('/save', async (req, res) => {
           title: plan.title,
           city: plan.city,
           date: plan.days[0]?.date || '',
-          duration: '',
+          duration,
           budget: plan.budget,
-          people: 0,
-          mood: [],
-          interests: [],
-          transport: '',
+          people,
+          mood,
+          interests,
+          transport,
           plan_data: plan,
           share_code: shareCode,
           status: 'active'
@@ -83,11 +127,12 @@ shareRouter.post('/save', async (req, res) => {
 /**
  * GET /api/plan/history
  * 查询当前用户的全部历史行程（按创建时间倒序）
- * query: userId - 当前匿名用户 id
+ * query: userId - 当前匿名用户 id（未登录时的回退方案）
  */
 shareRouter.get('/history', async (req, res) => {
   try {
-    const userId = req.query.userId as string | undefined
+    // 优先使用 JWT 校验后的可信用户 id，未登录时回退到 query.userId 保持兼容
+    const userId = req.user?.id || (req.query.userId as string | undefined)
 
     if (!userId) {
       res.status(400).json({ success: false, error: '缺少 userId 参数' })

@@ -1,6 +1,13 @@
 import { ref } from 'vue'
 import type { Plan, SSEMeta, SSEChunk, SSEDone, SSEError, SSEReasoning } from '@weekend-planner/shared'
 
+/** SSE progress 事件（坐标补充进度） */
+export interface SSEProgress {
+  current: number
+  total: number
+  location: string
+}
+
 /** 流式状态 */
 export type StreamStatus = 'idle' | 'streaming' | 'done' | 'error'
 
@@ -57,6 +64,7 @@ export function useStream() {
   const status = ref<StreamStatus>('idle')
   const error = ref<string>('')
   const meta = ref<SSEMeta | null>(null)
+  const enrichProgress = ref<SSEProgress | null>(null)
 
   let controller: AbortController | null = null
 
@@ -78,6 +86,7 @@ export function useStream() {
     status.value = 'streaming'
     error.value = ''
     meta.value = null
+    enrichProgress.value = null
 
     controller = new AbortController()
 
@@ -133,9 +142,14 @@ export function useStream() {
                 callbacks?.onChunk?.(chunk)
                 break
               }
+              case 'progress': {
+                enrichProgress.value = payload as SSEProgress
+                break
+              }
               case 'done':
                 plan.value = (payload as SSEDone).plan
                 status.value = 'done'
+                enrichProgress.value = null
                 callbacks?.onDone?.(payload as SSEDone)
                 break
               case 'error': {
@@ -192,6 +206,7 @@ export function useStream() {
     status.value = 'idle'
     error.value = ''
     meta.value = null
+    enrichProgress.value = null
   }
 
   return {
@@ -201,6 +216,7 @@ export function useStream() {
     status,
     error,
     meta,
+    enrichProgress,
     start,
     cancel,
     reset

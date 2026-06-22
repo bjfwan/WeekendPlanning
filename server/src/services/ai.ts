@@ -5,8 +5,10 @@ import { config } from '../config.js'
  * AI 服务（基于魔搭 ModelScope，使用 OpenAI 兼容协议）
  */
 
-/** 默认 AI 请求超时时间（毫秒） */
-const AI_TIMEOUT_MS = 120_000
+/** 默认 AI 请求超时时间（毫秒）
+ *  设为 55s，留 5s 余量，确保小于 Vercel 函数 maxDuration（60s，Hobby 计划上限）。
+ */
+const AI_TIMEOUT_MS = 55_000
 
 /**
  * 创建 OpenAI 客户端

@@ -1,6 +1,6 @@
 import { ref, readonly } from 'vue'
 import { useStream } from './useStream'
-import type { GeneratePlanRequest } from '@weekend-planner/shared'
+import type { GeneratePlanRequest, MultiUser } from '@weekend-planner/shared'
 
 /** API 基础地址，未配置时使用相对路径（依赖 Vite 代理） */
 const API_BASE = import.meta.env.VITE_API_BASE_URL || ''
@@ -18,9 +18,19 @@ export const planRequest = ref<GeneratePlanRequest | null>(null)
 export function usePlan() {
   const stream = useStream()
 
-  /** 调用后端生成行程（SSE 流式） */
-  async function generatePlan(request: GeneratePlanRequest): Promise<void> {
-    await stream.start(`${API_BASE}/api/plan/generate`, request)
+  /**
+   * 调用后端生成行程（SSE 流式）
+   * @param request 行程生成请求
+   * @param multiUsers 可选的多人协同偏好，传入后会合并到请求体
+   */
+  async function generatePlan(
+    request: GeneratePlanRequest,
+    multiUsers?: MultiUser[]
+  ): Promise<void> {
+    const requestBody: GeneratePlanRequest = multiUsers
+      ? { ...request, multiUsers: [...(request.multiUsers ?? []), ...multiUsers] }
+      : request
+    await stream.start(`${API_BASE}/api/plan/generate`, requestBody)
   }
 
   /** 重试：重置状态后重新生成 */
@@ -42,6 +52,7 @@ export function usePlan() {
     status: stream.status,
     error: stream.error,
     meta: stream.meta,
+    enrichProgress: stream.enrichProgress,
     // 操作方法
     generatePlan,
     retry,

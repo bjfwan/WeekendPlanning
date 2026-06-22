@@ -109,11 +109,13 @@ export async function fetchMembers(code: string): Promise<PlanPreferenceRecord[]
 /**
  * 订阅 plan_preferences 表的实时新增事件
  * @param code 分享码（用于标识订阅频道）
+ * @param planId 行程 id（用于按 plan_id 过滤，避免收到全表事件）
  * @param callback 新增成员回调
  * @returns 取消订阅函数
  */
 export function subscribeMembers(
   code: string,
+  planId: string,
   callback: (member: PlanPreferenceRecord) => void
 ): () => void {
   const channel = supabase
@@ -123,7 +125,8 @@ export function subscribeMembers(
       {
         event: 'INSERT',
         schema: 'public',
-        table: 'plan_preferences'
+        table: 'plan_preferences',
+        filter: 'plan_id=eq.' + planId
       },
       (payload) => {
         callback(payload.new as PlanPreferenceRecord)

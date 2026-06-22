@@ -1,9 +1,11 @@
 <script setup lang="ts">
 /** 行程详情页 - 通过分享码加载并展示已保存的行程 */
-import { ref, computed, onMounted, onUnmounted } from 'vue'
+import { ref, computed, onMounted, onUnmounted, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
-import type { Plan } from '@weekend-planner/shared'
-import { fetchPlanByCode } from '@/composables/useShare'
+import type { Plan, PlanPreferenceRecord, GeneratePlanRequest, PlanDuration } from '@weekend-planner/shared'
+import { fetchPlanByCode, fetchMembers, fetchMyPlans, subscribeMembers } from '@/composables/useShare'
+import { useAuth } from '@/composables/useAuth'
+import { planRequest } from '@/composables/usePlan'
 import BaseButton from '@/components/BaseButton.vue'
 import BaseCard from '@/components/BaseCard.vue'
 import ShareModal from '@/components/ShareModal.vue'
@@ -11,22 +13,42 @@ import PlanTimeline from '@/components/PlanTimeline.vue'
 import PlanChecklist from '@/components/PlanChecklist.vue'
 import AmapMap from '@/components/AmapMap.vue'
 import type { MapPoint } from '@/composables/useAmap'
-import type { TransportMode } from '@shared/types'
+import type { TransportMode, PlanItem } from '@weekend-planner/shared'
+import { haversineDistance, isValidChinaCoordinate } from '@weekend-planner/shared/utils'
 
 const route = useRoute()
 const router = useRouter()
 // 从路由参数获取分享码
 const shareCode = route.params.code as string
 
+const { user } = useAuth()
+
 // 行程数据
 const plan = ref<Plan | null>(null)
+// 行程 id（用于 Realtime 订阅过滤与创建者校验）
+const planId = ref('')
 // 加载状态
 const loading = ref(true)
 // 加载错误提示
 const loadError = ref('')
 
+// 已加入的成员列表
+const members = ref<PlanPreferenceRecord[]>([])
+// 当前用户是否为创建者
+const isCreator = ref(false)
+// Realtime 订阅取消函数
+let unsubscribe: (() => void) | null = null
+
 // 当前选中的日期 tab
 const activeDay = ref(0)
+
+// 路线排序方式：'time' 按时间顺序，'geo' 按地理顺序（默认按地理，后端已重排）
+const routeOrder = ref<'time' | 'geo'>('geo')
+
+// 跨日距离提示：切换日期 tab 时，如果当日起点距上一日终点超过 20km，显示提示
+const crossDayDistance = ref(0)
+const showCrossDayTip = ref(false)
+let crossDayTipTimer: ReturnType<typeof setTimeout> | null = null
 
 // 分享弹窗显示状态
 const shareModalShow = ref(false)
@@ -48,15 +70,27 @@ const amapRef = ref<InstanceType<typeof AmapMap> | null>(null)
 // 时间轴容器引用（用于点击地图标记时定位卡片）
 const timelineRef = ref<HTMLDivElement | null>(null)
 
+// 当前排序方式下用于地图展示的 items
+// - 'time'：优先用 originalItems（后端保存的原始时间顺序），兜底 items
+// - 'geo'：用 items（后端已按地理最近邻重排）
+const routeItems = computed<PlanItem[]>(() => {
+  const day = currentDay.value
+  if (!day) return []
+  if (routeOrder.value === 'time') {
+    const original = day.originalItems
+    return original ?? day.items
+  }
+  return day.items
+})
+
 // 当日有坐标的行程点，用于地图展示
 const mapPoints = computed<MapPoint[]>(() => {
-  if (!currentDay.value) return []
   const result: MapPoint[] = []
-  currentDay.value.items.forEach((item) => {
-    if (item.locationLng != null && item.locationLat != null) {
+  routeItems.value.forEach((item) => {
+    if (isValidChinaCoordinate(item.locationLng, item.locationLat)) {
       result.push({
-        lng: item.locationLng,
-        lat: item.locationLat,
+        lng: item.locationLng as number,
+        lat: item.locationLat as number,
         title: item.title,
         address: item.address,
         time: item.time,
@@ -69,18 +103,37 @@ const mapPoints = computed<MapPoint[]>(() => {
 
 // 地图点对应的原始 items 索引（用于点击联动定位到正确的卡片）
 const mapPointItemIndices = computed<number[]>(() => {
-  if (!currentDay.value) return []
   const indices: number[] = []
-  currentDay.value.items.forEach((item, i) => {
-    if (item.locationLng != null && item.locationLat != null) {
-      indices.push(i)
+  routeItems.value.forEach((routeItem, routeIdx) => {
+    if (isValidChinaCoordinate(routeItem.locationLng, routeItem.locationLat)) {
+      // 时间轴现在用 routeItems 渲染，所以索引就是 routeItems 中的位置
+      indices.push(routeIdx)
     }
   })
   return indices
 })
 
-// 交通方式：Plan 类型不含 transport 字段，默认 mixed
-const mapTransport = computed<TransportMode>(() => 'mixed')
+// 跨日连线：上一日最后一个有坐标的 item 坐标
+// 切换日期 tab 时，传给 AmapMap 画一条从上一日终点到当日起点的浅色虚线
+const crossDayPoint = computed<{ lng: number; lat: number } | null>(() => {
+  if (activeDay.value <= 0) return null
+  const prevDay = plan.value?.days[activeDay.value - 1]
+  if (!prevDay) return null
+  // 与当前排序方式保持一致：'time' 用 originalItems，'geo' 用 items
+  const prevItems = routeOrder.value === 'time'
+    ? (prevDay.originalItems ?? prevDay.items)
+    : prevDay.items
+  for (let i = prevItems.length - 1; i >= 0; i--) {
+    const item = prevItems[i]
+    if (isValidChinaCoordinate(item.locationLng, item.locationLat)) {
+      return { lng: item.locationLng as number, lat: item.locationLat as number }
+    }
+  }
+  return null
+})
+
+// 交通方式：优先用生成时保存的 plan.transport，否则默认 mixed
+const mapTransport = computed<TransportMode>(() => plan.value?.transport ?? 'mixed')
 
 // 窗口宽度（用于地图高度响应式切换）
 const windowWidth = ref(typeof window !== 'undefined' ? window.innerWidth : 1024)
@@ -143,6 +196,79 @@ function switchDay(idx: number) {
   activeDay.value = idx
 }
 
+/**
+ * 获取指定日期 tab 在当前排序方式下的路线 items
+ */
+function getDayRouteItems(dayIdx: number): PlanItem[] {
+  if (!plan.value) return []
+  if (dayIdx < 0 || dayIdx >= plan.value.days.length) return []
+  const day = plan.value.days[dayIdx]
+  if (routeOrder.value === 'time') {
+    const original = day.originalItems
+    return original ?? day.items
+  }
+  return day.items
+}
+
+/**
+ * 计算当日起点与上一日终点的跨日距离，超过 20km 时显示提示
+ */
+function updateCrossDayTip() {
+  showCrossDayTip.value = false
+  crossDayDistance.value = 0
+  if (crossDayTipTimer) {
+    clearTimeout(crossDayTipTimer)
+    crossDayTipTimer = null
+  }
+
+  const dayIdx = activeDay.value
+  if (dayIdx <= 0) return
+
+  const prevItems = getDayRouteItems(dayIdx - 1)
+  const currItems = getDayRouteItems(dayIdx)
+
+  // 上一日最后一个有坐标的 item
+  let prevLast: PlanItem | null = null
+  for (let i = prevItems.length - 1; i >= 0; i--) {
+    if (prevItems[i].locationLng != null && prevItems[i].locationLat != null) {
+      prevLast = prevItems[i]
+      break
+    }
+  }
+  if (!prevLast || prevLast.locationLng == null || prevLast.locationLat == null) return
+
+  // 当日第一个有坐标的 item
+  let currFirst: PlanItem | null = null
+  for (const item of currItems) {
+    if (item.locationLng != null && item.locationLat != null) {
+      currFirst = item
+      break
+    }
+  }
+  if (!currFirst || currFirst.locationLng == null || currFirst.locationLat == null) return
+
+  const dist = haversineDistance(
+    prevLast.locationLng,
+    prevLast.locationLat,
+    currFirst.locationLng,
+    currFirst.locationLat
+  )
+
+  if (dist > 20) {
+    crossDayDistance.value = Math.round(dist)
+    showCrossDayTip.value = true
+    crossDayTipTimer = setTimeout(() => {
+      showCrossDayTip.value = false
+      crossDayTipTimer = null
+    }, 5000)
+  }
+}
+
+// 切换日期 tab 时计算跨日距离提示
+watch(activeDay, () => {
+  updateCrossDayTip()
+})
+
 // 返回上一页，无历史时回到我的行程
 function goBack() {
   if (window.history.length > 1) {
@@ -167,12 +293,71 @@ function closeShareModal() {
   shareModalShow.value = false
 }
 
+/**
+ * 根据 plan.days 长度推断行程时长
+ */
+function inferDuration(dayCount: number): PlanDuration {
+  if (dayCount >= 3) return '3-day'
+  if (dayCount === 2) return '2-day'
+  if (dayCount === 1) return '1-day'
+  return 'half-day'
+}
+
+/**
+ * 基于成员偏好重新生成行程
+ * 将成员列表转换为 multiUsers，写入共享 planRequest 后跳转到 /plan
+ * PlanView 的 onMounted 会读取 planRequest 并调用 generatePlan
+ */
+function handleRegenerate() {
+  if (!plan.value || !members.value.length) return
+  // 收集所有成员的偏好去重后作为 interests
+  const allPreferences = Array.from(new Set(members.value.flatMap((m) => m.preferences)))
+  const request: GeneratePlanRequest = {
+    city: plan.value.city,
+    date: plan.value.days[0]?.date ?? '',
+    duration: inferDuration(plan.value.days.length),
+    budget: plan.value.budget,
+    people: members.value.length + 1,
+    mood: [],
+    interests: allPreferences,
+    transport: plan.value.transport ?? 'mixed',
+    multiUsers: members.value.map((m) => ({
+      nickname: m.nickname,
+      preferences: m.preferences
+    }))
+  }
+  planRequest.value = request
+  router.push({ name: 'plan' })
+}
+
 // 页面挂载时加载行程
 onMounted(async () => {
   window.addEventListener('resize', handleResize)
   try {
     const data = await fetchPlanByCode(shareCode)
     plan.value = data.plan
+    planId.value = data.planId
+
+    // 拉取已加入成员列表
+    members.value = await fetchMembers(shareCode)
+
+    // 判断当前用户是否为创建者：检查 plan 是否在用户的历史行程中
+    const userId = user.value?.id
+    if (userId) {
+      try {
+        const myPlans = await fetchMyPlans(userId)
+        isCreator.value = myPlans.some((p) => p.id === planId.value)
+      } catch {
+        isCreator.value = false
+      }
+    }
+
+    // 订阅 plan_preferences 表的实时新增（按 plan_id 过滤）
+    unsubscribe = subscribeMembers(shareCode, planId.value, (member) => {
+      // 避免重复添加同一成员
+      if (members.value.some((m) => m.id === member.id)) return
+      members.value.push(member)
+    })
   } catch (err) {
     loadError.value = err instanceof Error ? err.message : '行程不存在或分享码无效'
   } finally {
@@ -183,6 +368,11 @@ onMounted(async () => {
 // 离开页面时清理事件监听
 onUnmounted(() => {
   window.removeEventListener('resize', handleResize)
+  if (crossDayTipTimer) clearTimeout(crossDayTipTimer)
+  if (unsubscribe) {
+    unsubscribe()
+    unsubscribe = null
+  }
 })
 </script>
 
@@ -272,6 +462,45 @@ onUnmounted(() => {
           </div>
         </BaseCard>
 
+        <!-- 已加入的伙伴 -->
+        <BaseCard v-if="members.length" padding="md">
+          <div class="flex items-center justify-between mb-3">
+            <h3 class="font-bold text-navy flex items-center gap-2">
+              <span class="w-8 h-8 grid place-items-center rounded-lg bg-mint/20">👥</span>
+              已加入的伙伴（{{ members.length }}）
+            </h3>
+          </div>
+          <div class="space-y-2">
+            <div
+              v-for="m in members"
+              :key="m.id"
+              class="flex items-center gap-3 p-3 rounded-xl bg-cream/50"
+            >
+              <span class="w-10 h-10 grid place-items-center rounded-full bg-coral text-white text-sm font-bold shrink-0">
+                {{ m.nickname.charAt(0).toUpperCase() }}
+              </span>
+              <div class="flex-1 min-w-0">
+                <p class="text-sm font-semibold text-navy truncate">{{ m.nickname }}</p>
+                <div v-if="m.preferences.length" class="flex flex-wrap gap-1 mt-1">
+                  <span
+                    v-for="p in m.preferences"
+                    :key="p"
+                    class="text-xs px-2 py-0.5 rounded-full bg-navy/5 text-navy/60"
+                  >
+                    {{ p }}
+                  </span>
+                </div>
+              </div>
+            </div>
+          </div>
+          <!-- 基于成员偏好重新生成行程（仅创建者且成员数>0） -->
+          <div v-if="isCreator && members.length > 0" class="mt-4 pt-4 border-t border-navy/5">
+            <BaseButton variant="secondary" class="w-full" @click="handleRegenerate">
+              🔄 基于成员偏好重新生成行程
+            </BaseButton>
+          </div>
+        </BaseCard>
+
         <!-- 每日行程 -->
         <div v-if="plan.days.length">
           <!-- 日期切换 tab -->
@@ -294,23 +523,67 @@ onUnmounted(() => {
 
           <!-- 当日路线地图 -->
           <div v-if="currentDay" class="mb-4">
-            <h3 class="font-bold text-navy mb-3 flex items-center gap-2">
-              <span class="w-8 h-8 grid place-items-center rounded-lg bg-coral/15">📍</span>
-              当日路线地图
-            </h3>
-            <AmapMap
-              v-if="mapPoints.length > 0"
-              ref="amapRef"
-              :points="mapPoints"
-              :transport="mapTransport"
-              :height="mapHeight"
-              @point-click="handlePointClick"
-            />
-            <div
-              v-else
-              class="bg-white rounded-2xl p-6 shadow-card text-center text-navy/50 text-sm"
-            >
-              暂无地图数据
+            <div class="flex items-center justify-between gap-3 mb-3">
+              <h3 class="font-bold text-navy flex items-center gap-2">
+                <span class="w-8 h-8 grid place-items-center rounded-lg bg-coral/15">📍</span>
+                当日路线地图
+              </h3>
+              <!-- 路线排序切换：按地理（后端重排）/ 按时间（原始顺序） -->
+              <div class="inline-flex items-center gap-1 p-1 bg-white rounded-xl shadow-card">
+                <button
+                  type="button"
+                  class="px-3 py-1.5 rounded-lg text-xs font-semibold transition-all duration-200 outline-none border-none"
+                  :class="
+                    routeOrder === 'geo'
+                      ? 'bg-coral text-white shadow-sm'
+                      : 'bg-transparent text-navy/60 hover:text-navy hover:bg-cream-dark/30'
+                  "
+                  @click="routeOrder = 'geo'"
+                >
+                  🗺️ 按地理
+                </button>
+                <button
+                  type="button"
+                  class="px-3 py-1.5 rounded-lg text-xs font-semibold transition-all duration-200 outline-none border-none"
+                  :class="
+                    routeOrder === 'time'
+                      ? 'bg-coral text-white shadow-sm'
+                      : 'bg-transparent text-navy/60 hover:text-navy hover:bg-cream-dark/30'
+                  "
+                  @click="routeOrder = 'time'"
+                >
+                  ⏰ 按时间
+                </button>
+              </div>
+            </div>
+            <div class="relative">
+              <!-- 跨日距离提示 -->
+              <Transition name="cross-day-tip">
+                <div
+                  v-if="showCrossDayTip"
+                  class="absolute top-2 left-0 right-0 z-20 flex justify-center px-4 pointer-events-none"
+                >
+                  <div class="px-4 py-2 rounded-xl bg-white/95 backdrop-blur shadow-lg border border-coral/20 text-sm font-semibold text-navy whitespace-nowrap">
+                    📍 距上一日终点 {{ crossDayDistance }} km
+                  </div>
+                </div>
+              </Transition>
+              <AmapMap
+                v-if="mapPoints.length > 0"
+                ref="amapRef"
+                :points="mapPoints"
+                :transport="mapTransport"
+                :height="mapHeight"
+                :city="plan.city"
+                :crossDayPoint="crossDayPoint"
+                @point-click="handlePointClick"
+              />
+              <div
+                v-else
+                class="bg-white rounded-2xl p-6 shadow-card text-center text-navy/50 text-sm"
+              >
+                暂无地图数据
+              </div>
             </div>
           </div>
 
@@ -323,7 +596,7 @@ onUnmounted(() => {
               <span v-if="currentDay" class="text-sm text-navy/50">{{ currentDay.date }}</span>
             </div>
             <div ref="timelineRef">
-              <PlanTimeline v-if="currentDay" :day="currentDay" />
+              <PlanTimeline v-if="currentDay" :day="currentDay" :items="routeItems" />
             </div>
           </BaseCard>
         </div>
@@ -349,3 +622,19 @@ onUnmounted(() => {
     />
   </div>
 </template>
+
+<style scoped>
+/* 跨日距离提示：淡入淡出 */
+.cross-day-tip-enter-active {
+  transition: opacity 0.3s ease;
+}
+.cross-day-tip-enter-from {
+  opacity: 0;
+}
+.cross-day-tip-leave-active {
+  transition: opacity 0.3s ease;
+}
+.cross-day-tip-leave-to {
+  opacity: 0;
+}
+</style>

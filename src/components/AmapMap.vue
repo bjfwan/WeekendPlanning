@@ -8,7 +8,25 @@
  */
 import { ref, shallowRef, onMounted, onBeforeUnmount, watch } from 'vue'
 import { loadAMap, type MapPoint, type TransportOption } from '@/composables/useAmap'
-import type { TransportMode } from '@shared/types'
+import type { TransportMode } from '@weekend-planner/shared'
+
+/** 公交/地铁路线分段信息 */
+interface RouteSegment {
+  /** 坐标点数组 */
+  path: any[]
+  /** 段类型：transit（公交/地铁）或 walking（步行） */
+  type: 'transit' | 'walking'
+  /** transit_mode: 'BUS' | 'SUBWAY'（仅 transit 段有） */
+  mode?: string
+  /** 线路名称（如"地铁1号线"、"公交301路"，仅 transit 段有） */
+  name?: string
+}
+
+/** 可动画的路线层（记录目标透明度，用于逐段显示动画） */
+interface AnimatableLayer {
+  layer: any
+  targetOpacity: number
+}
 
 interface Props {
   /** POI 点列表 */
@@ -17,11 +35,16 @@ interface Props {
   transport?: TransportMode
   /** 地图高度，默认 '400px' */
   height?: string
+  /** 公交换乘城市，默认 '北京' */
+  city?: string
+  /** 上一日终点的坐标，用于画跨日虚线（null/undefined 表示不画） */
+  crossDayPoint?: { lng: number; lat: number } | null
 }
 
 const props = withDefaults(defineProps<Props>(), {
   transport: 'mixed',
-  height: '400px'
+  height: '400px',
+  city: '北京'
 })
 
 const emit = defineEmits<{
@@ -43,6 +66,8 @@ const planning = ref(false)
 // ========== 内部实例（shallowRef 避免深度代理 AMap 大对象） ==========
 const AMap = shallowRef<any>(null)
 const map = shallowRef<any>(null)
+/** 跨日虚线引用（独立于 routeLayers，避免被 clearRoute 清理） */
+const crossDayLineRef = shallowRef<any>(null)
 
 // 标记、路线层、信息窗等内部集合不需要响应式，用普通变量即可（不会被 Vue 代理）
 let markers: any[] = []
@@ -53,12 +78,15 @@ let planSessionId = 0
 /** 导航插件是否已加载 */
 let pluginsReady = false
 
+/** 路线分段组（每组对应两个相邻标记之间的一段路线，用于逐段动画） */
+let routeSegmentGroups: AnimatableLayer[][] = []
+/** 当前正在绘制的分段组（null 表示不在分组模式，路线创建后立即可见） */
+let currentSegmentGroup: AnimatableLayer[] | null = null
+
 // ========== 常量 ==========
 const COLOR_CORAL = '#FF6B6B'
 const COLOR_AMBER = '#FFD93D'
 const COLOR_MINT = '#4ECDC4'
-/** 公交换乘默认城市（接口固定，无法从 props 传入） */
-const DEFAULT_CITY = '北京'
 
 // ========== 交通方式选项 ==========
 const transportOptions: TransportOption[] = [
@@ -88,6 +116,8 @@ function getPointColor(idx: number): string {
  * 创建数字标记的 HTML 内容
  * - 32px 圆形，3px 白色边框，阴影
  * - 上方浮动时间标签（小字）
+ * - 初始状态：灰色、缩小（scale 0.5），等待 activateMarker 触发动画
+ * - 内部含 ripple 元素：颜色从中心向边缘扩散（overflow: hidden 限制不超出圆圈）
  */
 function createMarkerContent(idx: number, color: string, time?: string): string {
   const num = idx + 1
@@ -120,21 +150,46 @@ function createMarkerContent(idx: number, color: string, time?: string): string 
     transition: transform 0.2s ease;
   ">
     ${timeHtml}
-    <div style="
+    <div class="map-marker-wrapper" style="
       width: 32px;
       height: 32px;
-      border-radius: 50%;
-      background: ${color};
-      color: ${textColor};
-      display: flex;
-      align-items: center;
-      justify-content: center;
-      font-weight: 700;
-      font-size: 15px;
-      font-family: 'Noto Sans SC', sans-serif;
-      border: 3px solid #FFFFFF;
-      box-shadow: 0 2px 8px rgba(26,26,46,0.35);
-    ">${num}</div>
+      transform: scale(0.5);
+      transition: transform 0.4s cubic-bezier(0.34, 1.56, 0.64, 1);
+    ">
+      <div class="map-marker-dot" data-marker-color="${color}" style="
+        width: 32px;
+        height: 32px;
+        border-radius: 50%;
+        background: #CCCCCC;
+        color: #999999;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        font-weight: 700;
+        font-size: 15px;
+        font-family: 'Noto Sans SC', sans-serif;
+        border: 3px solid #AAAAAA;
+        box-shadow: 0 2px 8px rgba(26,26,46,0.35);
+        position: relative;
+        overflow: hidden;
+        transition: border-color 0.5s ease 0.1s, box-shadow 0.5s ease 0.1s;
+      ">
+        <span class="map-marker-ripple" style="
+          position: absolute;
+          inset: 0;
+          border-radius: 50%;
+          background: ${color};
+          transform: scale(0);
+          transition: transform 0.5s ease;
+          z-index: 1;
+        "></span>
+        <span class="map-marker-text" style="
+          position: relative;
+          z-index: 2;
+          transition: color 0.5s ease 0.2s;
+        ">${num}</span>
+      </div>
+    </div>
   </div>`
 }
 
@@ -177,6 +232,45 @@ function createMarkers(): void {
 function scaleMarker(idx: number, scale: number): void {
   const el = mapContainer.value?.querySelector(`[data-marker-idx="${idx}"]`) as HTMLElement | null
   if (el) el.style.transform = `scale(${scale})`
+}
+
+/**
+ * 激活标记点（从小变大 + 颜色从灰色扩散到目标色）
+ * - 缩放：wrapper 从 scale(0.5) → scale(1)（弹性缓动）
+ * - 颜色扩散：内部 ripple 从 scale(0) → scale(1)，颜色从中心向边缘填充
+ *   overflow: hidden 确保不超出圆圈范围
+ * - 边框从灰色变白色，阴影变为目标色光晕
+ * - 文字颜色从灰色变为目标色
+ */
+function activateMarker(idx: number): void {
+  const el = mapContainer.value?.querySelector(`[data-marker-idx="${idx}"]`) as HTMLElement | null
+  if (!el) return
+
+  const wrapper = el.querySelector('.map-marker-wrapper') as HTMLElement | null
+  const dot = el.querySelector('.map-marker-dot') as HTMLElement | null
+  const ripple = el.querySelector('.map-marker-ripple') as HTMLElement | null
+  const text = el.querySelector('.map-marker-text') as HTMLElement | null
+
+  // 缩放：从小变大
+  if (wrapper) wrapper.style.transform = 'scale(1)'
+
+  if (dot) {
+    const color = dot.dataset.markerColor || COLOR_CORAL
+    // 边框变白
+    dot.style.borderColor = '#FFFFFF'
+    // 阴影变为目标色光晕
+    dot.style.boxShadow = `0 2px 12px ${color}99`
+  }
+
+  // 颜色从中间向周围扩散（不超出圆圈，因父级 overflow: hidden）
+  if (ripple) ripple.style.transform = 'scale(1)'
+
+  // 文字变色
+  if (text && dot) {
+    const color = dot.dataset.markerColor || COLOR_CORAL
+    const textColor = color === COLOR_CORAL ? '#FFFFFF' : '#1A1A2E'
+    text.style.color = textColor
+  }
 }
 
 /**
@@ -227,6 +321,72 @@ function clearRoute(): void {
   const m = map.value
   routeLayers.forEach((l) => m?.remove(l))
   routeLayers = []
+  routeSegmentGroups = []
+  currentSegmentGroup = null
+}
+
+/**
+ * 开始一个新的分段组（用于逐段路线动画）
+ * 在 startSegmentGroup / endSegmentGroup 之间创建的路线层会被追踪，
+ * 创建后立即设为透明，等待 animateRoute 逐段显示。
+ */
+function startSegmentGroup(): void {
+  currentSegmentGroup = []
+}
+
+/**
+ * 结束当前分段组，将其加入 routeSegmentGroups
+ */
+function endSegmentGroup(): void {
+  if (currentSegmentGroup && currentSegmentGroup.length > 0) {
+    routeSegmentGroups.push(currentSegmentGroup)
+  }
+  currentSegmentGroup = null
+}
+
+/**
+ * 将路线层加入当前分段组（用于动画追踪）
+ * 在分组模式下，创建后立即设为透明，等待 animateRoute 逐段显示
+ */
+function trackLayer(layer: any, targetOpacity: number): void {
+  if (currentSegmentGroup) {
+    currentSegmentGroup.push({ layer, targetOpacity })
+    layer.setOptions({ strokeOpacity: 0 })
+  }
+}
+
+/**
+ * 画跨日虚线（从上一日终点到当日起点）
+ * - 浅灰色虚线，zIndex 低于主路线，不遮挡主路线
+ */
+function drawCrossDayLine(from: { lng: number; lat: number }, to: MapPoint): void {
+  const amap = AMap.value
+  const m = map.value
+  if (!amap || !m) return
+  const polyline = new amap.Polyline({
+    path: [
+      [from.lng, from.lat],
+      [to.lng, to.lat]
+    ],
+    strokeColor: '#999',
+    strokeWeight: 2,
+    strokeStyle: 'dashed',
+    strokeOpacity: 0.6,
+    zIndex: 40
+  })
+  m.add(polyline)
+  crossDayLineRef.value = polyline
+}
+
+/**
+ * 清理跨日虚线
+ */
+function clearCrossDayLine(): void {
+  const m = map.value
+  if (crossDayLineRef.value) {
+    m?.remove(crossDayLineRef.value)
+    crossDayLineRef.value = null
+  }
 }
 
 /**
@@ -248,6 +408,7 @@ function drawRouteWithOutline(path: any[]): void {
   })
   m.add(outline)
   routeLayers.push(outline)
+  trackLayer(outline, 1)
   // coral 主线（细线，画在描边之上）
   const main = new amap.Polyline({
     path,
@@ -261,6 +422,53 @@ function drawRouteWithOutline(path: any[]): void {
   })
   m.add(main)
   routeLayers.push(main)
+  trackLayer(main, 0.9)
+}
+
+/**
+ * 绘制公交/地铁路线（按段类型分别绘制）
+ * - 地铁段（SUBWAY）：蓝色实线（#3B82F6）
+ * - 公交段（BUS）：coral 实线（保持现有风格）
+ * - 步行段（walking）：灰色虚线（#999）
+ */
+function drawTransitRoute(segments: RouteSegment[]): void {
+  const amap = AMap.value
+  const m = map.value
+  if (!amap || !m) return
+  for (const seg of segments) {
+    if (!seg.path || seg.path.length === 0) continue
+    let color = COLOR_CORAL
+    let weight = 5
+    let style: 'solid' | 'dashed' = 'solid'
+    let opacity = 0.9
+
+    if (seg.type === 'walking') {
+      color = '#999'
+      weight = 2
+      style = 'dashed'
+      opacity = 0.6
+    } else if (seg.mode === 'SUBWAY') {
+      color = '#3B82F6' // 蓝色 - 地铁
+      weight = 5
+    } else if (seg.mode === 'BUS') {
+      color = COLOR_CORAL // coral - 公交
+      weight = 5
+    }
+
+    const polyline = new amap.Polyline({
+      path: seg.path,
+      strokeColor: color,
+      strokeWeight: weight,
+      strokeStyle: style,
+      strokeOpacity: opacity,
+      lineJoin: 'round',
+      lineCap: 'round',
+      zIndex: 51
+    })
+    m.add(polyline)
+    routeLayers.push(polyline)
+    trackLayer(polyline, opacity)
+  }
 }
 
 /**
@@ -286,6 +494,7 @@ function drawDashedLine(start: MapPoint, end: MapPoint): void {
   })
   m.add(line)
   routeLayers.push(line)
+  trackLayer(line, 0.7)
 }
 
 /**
@@ -313,33 +522,64 @@ function preloadPlugins(): Promise<void> {
 }
 
 /**
- * 规划单段路线（两个相邻点之间）
- * @returns 是否成功绘制了导航路径
+ * 规划单段路线并返回路径数据（不绘制）
+ * @param mode 交通方式，mixed 强制使用 Driving 走真实道路
+ * @returns 成功返回路径点数组，失败返回 null
  */
-function planSegment(start: MapPoint, end: MapPoint): Promise<boolean> {
+function searchSegmentPath(
+  start: MapPoint,
+  end: MapPoint,
+  mode: TransportMode
+): Promise<any[] | null> {
   const amap = AMap.value
   const sessionId = planSessionId
   return new Promise((resolve) => {
     if (!amap) {
-      resolve(false)
+      resolve(null)
       return
+    }
+
+    // 超时保护：15秒后返回 null，避免步行距离过长等情况长时间卡住
+    let settled = false
+    const timeout = setTimeout(() => {
+      if (settled) return
+      settled = true
+      console.warn(`[AmapMap] ${mode} 规划超时`)
+      resolve(null)
+    }, 15000)
+
+    const done = (value: any[] | null): void => {
+      if (settled) return
+      settled = true
+      clearTimeout(timeout)
+      resolve(value)
     }
 
     let planner: any
     try {
-      if (currentTransport.value === 'driving') {
+      // mixed 模式强制使用 Driving 走真实道路网
+      if (mode === 'driving' || mode === 'mixed') {
         planner = new amap.Driving({ policy: amap.DrivingPolicy.LEAST_TIME })
-      } else if (currentTransport.value === 'walking') {
+      } else if (mode === 'walking') {
         planner = new amap.Walking()
-      } else if (currentTransport.value === 'public') {
-        planner = new amap.Transfer({ city: DEFAULT_CITY })
+      } else if (mode === 'public') {
+        const city = props.city
+        if (!city) {
+          console.warn('[AmapMap] 公交模式缺少城市参数，跳过规划')
+          done(null)
+          return
+        }
+        planner = new amap.Transfer({
+          city,
+          policy: amap.TransferPolicy?.LEAST_TIME
+        })
       } else {
-        resolve(false)
+        done(null)
         return
       }
     } catch (e) {
       console.warn('导航插件实例化失败', e)
-      resolve(false)
+      done(null)
       return
     }
 
@@ -349,49 +589,358 @@ function planSegment(start: MapPoint, end: MapPoint): Promise<boolean> {
       (status: string, result: any) => {
         // 会话已被新的规划取代，忽略旧回调
         if (sessionId !== planSessionId || !map.value) {
-          resolve(false)
+          done(null)
           return
         }
-        if (status === 'complete' && result) {
-          try {
-            // driving/walking 返回 routes，transfer 返回 plans
-            const routes = result.routes || result.plans || []
-            const allPaths: any[] = []
-            routes.forEach((route: any) => {
-              // driving/walking 用 steps，transfer 用 segments
-              const segments = route.steps || route.segments || []
-              segments.forEach((seg: any) => {
-                // driving/walking: seg.path
-                // transfer: seg.transit.path 或 seg.walking.path
-                const path = seg.path || seg.transit?.path || seg.walking?.path
-                if (path && path.length > 0) {
-                  allPaths.push(...path)
-                }
-              })
-            })
-            if (allPaths.length > 1) {
-              drawRouteWithOutline(allPaths)
-              resolve(true)
-              return
-            }
-          } catch (e) {
-            console.warn('解析导航结果失败', e)
-          }
+        if (status !== 'complete' || !result) {
+          console.warn(`[AmapMap] ${mode} 路径规划失败:`, status, result)
+          done(null)
+          return
         }
-        resolve(false)
+        try {
+          // driving/walking 返回 routes（通常1条），transfer 返回 plans（多个备选方案）
+          // public 模式只取第一个 plan，避免多个方案叠加导致路线混乱
+          const routes = mode === 'public'
+            ? (result.plans?.slice(0, 1) || [])
+            : (result.routes || [])
+          const allPaths: any[] = []
+          routes.forEach((route: any) => {
+            // driving/walking 用 steps，transfer 用 segments
+            const segments = route.steps || route.segments || []
+            segments.forEach((seg: any) => {
+              // driving/walking: seg.path
+              // transfer: seg.transit.path 或 seg.walking.path
+              const path = seg.path || seg.transit?.path || seg.walking?.path
+              if (path && path.length > 0) {
+                allPaths.push(...path)
+              }
+            })
+          })
+          if (allPaths.length > 1) {
+            done(allPaths)
+            return
+          }
+        } catch (e) {
+          console.warn('解析导航结果失败', e)
+        }
+        done(null)
       }
     )
   })
 }
 
 /**
- * 规划完整路线（分段规划相邻点之间的路线）
+ * 公交模式专用：规划单段路线并返回分段信息（区分公交/地铁/步行）
+ * @returns 成功返回 RouteSegment[]，失败返回 null
+ */
+function searchTransitSegments(
+  start: MapPoint,
+  end: MapPoint
+): Promise<RouteSegment[] | null> {
+  const amap = AMap.value
+  const sessionId = planSessionId
+  return new Promise((resolve) => {
+    if (!amap) {
+      resolve(null)
+      return
+    }
+
+    const city = props.city
+    if (!city) {
+      console.warn('[AmapMap] 公交模式缺少城市参数，跳过规划')
+      resolve(null)
+      return
+    }
+
+    let planner: any
+    try {
+      planner = new amap.Transfer({
+        city,
+        policy: amap.TransferPolicy?.LEAST_TIME
+      })
+    } catch (e) {
+      console.warn('Transfer 插件实例化失败', e)
+      resolve(null)
+      return
+    }
+
+    planner.search(
+      [start.lng, start.lat],
+      [end.lng, end.lat],
+      (status: string, result: any) => {
+        // 会话已被新的规划取代，忽略旧回调
+        if (sessionId !== planSessionId || !map.value) {
+          resolve(null)
+          return
+        }
+        if (status !== 'complete' || !result) {
+          console.warn('[AmapMap] public 路径规划失败:', status, result)
+          resolve(null)
+          return
+        }
+        try {
+          // 只取第一个方案，避免多个方案叠加导致路线混乱
+          const plan = result.plans?.[0]
+          if (!plan) {
+            resolve(null)
+            return
+          }
+          const segments: RouteSegment[] = []
+          for (const seg of (plan.segments || [])) {
+            if (seg.transit?.path && seg.transit.path.length > 0) {
+              segments.push({
+                path: seg.transit.path,
+                type: 'transit',
+                mode: seg.transit.transit_mode, // 'BUS' or 'SUBWAY'
+                name: seg.transit.name
+              })
+            } else if (seg.walking?.path && seg.walking.path.length > 0) {
+              segments.push({
+                path: seg.walking.path,
+                type: 'walking'
+              })
+            }
+          }
+          if (segments.length > 0) {
+            resolve(segments)
+            return
+          }
+        } catch (e) {
+          console.warn('解析公交结果失败', e)
+        }
+        resolve(null)
+      }
+    )
+  })
+}
+
+/**
+ * 使用途径点一次性规划路线（仅 driving/mixed 支持）
+ * 高德 Transfer（公交）不支持途径点；
+ * AMap.Walking 的 search 不接受 waypoints 参数（传入会卡住不回调），故 walking 模式也不走此函数。
+ * @returns 成功返回完整路径点数组，失败返回 null
+ */
+function searchPathWithWaypoints(
+  points: MapPoint[],
+  mode: TransportMode
+): Promise<any[] | null> {
+  const amap = AMap.value
+  const sessionId = planSessionId
+  return new Promise((resolve) => {
+    if (!amap || points.length < 2) {
+      resolve(null)
+      return
+    }
+
+    // 超时保护：15秒后返回 null，避免途径点规划长时间卡住
+    let settled = false
+    const timeout = setTimeout(() => {
+      if (settled) return
+      settled = true
+      console.warn(`[AmapMap] ${mode} 途径点规划超时`)
+      resolve(null)
+    }, 15000)
+
+    const done = (value: any[] | null): void => {
+      if (settled) return
+      settled = true
+      clearTimeout(timeout)
+      resolve(value)
+    }
+
+    let planner: any
+    try {
+      // mixed 模式强制使用 Driving 走真实道路网
+      if (mode === 'driving' || mode === 'mixed') {
+        planner = new amap.Driving({ policy: amap.DrivingPolicy.LEAST_TIME })
+      } else if (mode === 'walking') {
+        planner = new amap.Walking()
+      } else {
+        done(null)
+        return
+      }
+    } catch (e) {
+      console.warn('导航插件实例化失败', e)
+      done(null)
+      return
+    }
+
+    const origin = [points[0].lng, points[0].lat]
+    const destination = [points[points.length - 1].lng, points[points.length - 1].lat]
+    const waypoints = points.slice(1, -1).map((p) => [p.lng, p.lat])
+
+    planner.search(
+      origin,
+      destination,
+      { waypoints },
+      (status: string, result: any) => {
+        if (sessionId !== planSessionId || !map.value) {
+          done(null)
+          return
+        }
+        if (status !== 'complete' || !result) {
+          console.warn(`[AmapMap] ${mode} 途径点规划失败:`, status, result)
+          done(null)
+          return
+        }
+        try {
+          const routes = result.routes || []
+          const allPaths: any[] = []
+          routes.forEach((route: any) => {
+            const steps = route.steps || []
+            steps.forEach((step: any) => {
+              if (step.path && step.path.length > 0) {
+                allPaths.push(...step.path)
+              }
+            })
+          })
+          if (allPaths.length > 1) {
+            done(allPaths)
+            return
+          }
+        } catch (e) {
+          console.warn('解析途径点导航结果失败', e)
+        }
+        done(null)
+      }
+    )
+  })
+}
+
+/**
+ * 规划单段路线（两个相邻点之间）
+ * @returns 是否成功绘制了导航路径
+ */
+async function planSegment(start: MapPoint, end: MapPoint): Promise<boolean> {
+  const path = await searchSegmentPath(start, end, currentTransport.value)
+  if (path) {
+    drawRouteWithOutline(path)
+    return true
+  }
+  return false
+}
+
+/**
+ * 将完整路径按标记点位置拆分为多段（用于逐段动画）
+ * 通过查找路径中距离每个中间标记最近的点来拆分
+ */
+function splitPathByPoints(path: any[], points: MapPoint[]): any[][] {
+  if (points.length <= 2 || path.length < 2) return [path]
+
+  // 为每个中间标记找路径中最近的点索引
+  const splitIndices: number[] = [0]
+  for (let i = 1; i < points.length - 1; i++) {
+    const target = [points[i].lng, points[i].lat]
+    let minDist = Infinity
+    let minIdx = 0
+    for (let j = 1; j < path.length - 1; j++) {
+      const dx = path[j][0] - target[0]
+      const dy = path[j][1] - target[1]
+      const dist = dx * dx + dy * dy
+      if (dist < minDist) {
+        minDist = dist
+        minIdx = j
+      }
+    }
+    // 确保索引严格递增
+    if (minIdx > splitIndices[splitIndices.length - 1]) {
+      splitIndices.push(minIdx)
+    } else {
+      splitIndices.push(splitIndices[splitIndices.length - 1] + 1)
+    }
+  }
+  splitIndices.push(path.length - 1)
+
+  // 按拆分点切分子路径
+  const segments: any[][] = []
+  for (let i = 0; i < splitIndices.length - 1; i++) {
+    const start = splitIndices[i]
+    const end = splitIndices[i + 1]
+    if (end > start) {
+      segments.push(path.slice(start, end + 1))
+    }
+  }
+
+  if (segments.length === 0) return [path]
+  return segments
+}
+
+/**
+ * 逐段动画显示路线 + 逐个激活标记点
+ * - 先激活起点标记
+ * - 逐段显示路线（strokeOpacity 0 → 目标值）
+ * - 每段显示后激活下一个标记
+ * - 总时长控制在 2-3 秒内（每段约 300ms + 标记 100ms）
+ * - 通过 sessionId 检查取消旧动画
+ */
+async function animateRoute(sessionId: number): Promise<void> {
+  const totalSegments = routeSegmentGroups.length
+  const totalMarkers = markers.length
+
+  if (totalMarkers === 0) return
+
+  // 没有路线段：直接逐个激活标记
+  if (totalSegments === 0) {
+    for (let i = 0; i < totalMarkers; i++) {
+      if (sessionId !== planSessionId) return
+      activateMarker(i)
+      await new Promise((resolve) => setTimeout(resolve, 150))
+    }
+    return
+  }
+
+  // 激活起点标记
+  activateMarker(0)
+  await new Promise((resolve) => setTimeout(resolve, 200))
+
+  // 逐段显示路线 + 激活下一个标记
+  for (let i = 0; i < totalSegments; i++) {
+    if (sessionId !== planSessionId) return
+
+    // 显示第 i 段路线
+    const group = routeSegmentGroups[i]
+    for (const { layer, targetOpacity } of group) {
+      layer.setOptions({ strokeOpacity: targetOpacity })
+    }
+
+    await new Promise((resolve) => setTimeout(resolve, 300))
+
+    if (sessionId !== planSessionId) return
+
+    // 激活第 i+1 个标记
+    if (i + 1 < totalMarkers) {
+      activateMarker(i + 1)
+      await new Promise((resolve) => setTimeout(resolve, 100))
+    }
+  }
+}
+
+/**
+ * 规划完整路线
+ * - public 模式：分段规划，区分公交/地铁/步行样式
+ * - driving/mixed 模式且点数 > 2：优先用途径点一次性规划，失败回退分段规划
+ * - walking 模式：直接用分段规划（AMap.Walking 不支持 waypoints 参数，传入会卡住不回调）
+ * - 规划完成后调用 animateRoute 逐段显示路线 + 逐个激活标记
  */
 async function planRoute(): Promise<void> {
   const m = map.value
   if (!m) return
+
+  // 先清理旧的跨日虚线
+  clearCrossDayLine()
+
+  // 画跨日虚线（在主路线之前画，zIndex 较低，不遮挡主路线）
+  // 即使 points 不足 2 个，只要有起点也画跨日虚线
+  if (props.crossDayPoint && props.points.length > 0) {
+    drawCrossDayLine(props.crossDayPoint, props.points[0])
+  }
+
   if (props.points.length < 2) {
     clearRoute()
+    // 没有路线，直接激活所有标记
+    for (let i = 0; i < markers.length; i++) {
+      activateMarker(i)
+    }
     return
   }
 
@@ -400,47 +949,133 @@ async function planRoute(): Promise<void> {
   clearRoute()
 
   try {
-    if (currentTransport.value === 'mixed') {
-      // mixed 模式直接用直线连接
-      drawStraightLine()
-    } else {
-      // 分段规划相邻点之间的路线
-      let anySuccess = false
-      for (let i = 0; i < props.points.length - 1; i++) {
-        // 被新的规划取代时提前退出
-        if (sessionId !== planSessionId) {
-          planning.value = false
-          return
-        }
-        const ok = await planSegment(props.points[i], props.points[i + 1])
-        if (sessionId !== planSessionId) {
-          planning.value = false
-          return
-        }
-        if (ok) {
-          anySuccess = true
-        } else {
-          // 导航失败，回退到虚线直线
-          drawDashedLine(props.points[i], props.points[i + 1])
-        }
+    const mode = currentTransport.value
+    const isPublic = mode === 'public'
+
+    // driving/mixed 模式且点数 > 2：优先用途径点一次性规划
+    // walking 模式不支持途径点（AMap.Walking 不接受 waypoints 参数），直接走分段规划
+    if (!isPublic && mode !== 'walking' && props.points.length > 2) {
+      const fullPath = await searchPathWithWaypoints(props.points, mode)
+      if (sessionId !== planSessionId) {
+        planning.value = false
+        return
       }
-      // 全部失败且没有任何路线，回退到直线连接
-      if (!anySuccess && routeLayers.length === 0) {
-        drawStraightLine()
+      if (fullPath) {
+        // 将完整路径按标记点拆分为多段，用于逐段动画
+        const subPaths = splitPathByPoints(fullPath, props.points)
+        for (const subPath of subPaths) {
+          startSegmentGroup()
+          drawRouteWithOutline(subPath)
+          endSegmentGroup()
+        }
+        // 规划完成后自适应视野（包含标记和路线）+ 逐段动画
+        if (sessionId === planSessionId) {
+          const allOverlays = [...markers, ...routeLayers]
+          if (allOverlays.length > 0) {
+            m.setFitView(allOverlays, false, [80, 80, 80, 80])
+          }
+          await animateRoute(sessionId)
+        }
+        return
       }
+      // 途径点规划失败，回退到分段规划
+      console.warn(`[AmapMap] ${mode} 途径点规划失败，回退到分段规划`)
     }
 
-    // 规划完成后自适应视野（包含标记和路线）
+    // 分段规划（public 模式必走此分支；其他模式作为途径点规划的回退）
+    // mixed 模式由 searchSegmentPath 内部强制使用 Driving 走真实道路网
+    const segmentPromises: Promise<{
+      success: boolean
+      start: MapPoint
+      end: MapPoint
+      path: any[] | null
+      segments: RouteSegment[] | null
+    }>[] = []
+    for (let i = 0; i < props.points.length - 1; i++) {
+      const start = props.points[i]
+      const end = props.points[i + 1]
+      if (isPublic) {
+        segmentPromises.push(
+          searchTransitSegments(start, end).then((segments) => ({
+            success: !!segments,
+            start,
+            end,
+            path: null,
+            segments
+          }))
+        )
+      } else {
+        segmentPromises.push(
+          searchSegmentPath(start, end, mode).then((path) => ({
+            success: !!path,
+            start,
+            end,
+            path,
+            segments: null
+          }))
+        )
+      }
+    }
+    const segmentResults = await Promise.all(segmentPromises)
+
+    // 检查会话有效性（并发期间可能已被新的规划取代）
+    if (sessionId !== planSessionId) {
+      planning.value = false
+      return
+    }
+
+    // 统一失败处理：所有模式采用相同的成功率判断策略
+    const totalCount = segmentResults.length
+    const successCount = segmentResults.filter((r) => r.success).length
+    const successRate = totalCount > 0 ? successCount / totalCount : 0
+    console.log(
+      `[AmapMap] ${mode} 模式路线规划成功率: ${successCount}/${totalCount} (${(successRate * 100).toFixed(1)}%)`
+    )
+
+    if (successRate >= 0.5) {
+      // 成功率 >= 50%：成功的段画实线，失败的段画虚线
+      // 每段路线用 startSegmentGroup/endSegmentGroup 包裹，用于逐段动画
+      segmentResults.forEach((r) => {
+        startSegmentGroup()
+        if (isPublic && r.segments) {
+          drawTransitRoute(r.segments)
+        } else if (!isPublic && r.path) {
+          drawRouteWithOutline(r.path)
+        } else {
+          drawDashedLine(r.start, r.end)
+        }
+        endSegmentGroup()
+      })
+    } else {
+      // 成功率 < 50%：全部回退为直线折线，避免实线-虚线混杂
+      startSegmentGroup()
+      const straightPath = props.points.map((p) => [p.lng, p.lat])
+      drawRouteWithOutline(straightPath)
+      endSegmentGroup()
+    }
+
+    // 规划完成后自适应视野（包含标记和路线）+ 逐段动画
     if (sessionId === planSessionId) {
       const allOverlays = [...markers, ...routeLayers]
       if (allOverlays.length > 0) {
         m.setFitView(allOverlays, false, [80, 80, 80, 80])
       }
+      await animateRoute(sessionId)
     }
   } catch (e) {
     console.warn('导航规划失败', e)
     if (sessionId === planSessionId && routeLayers.length === 0) {
-      drawStraightLine()
+      startSegmentGroup()
+      const straightPath = props.points.map((p) => [p.lng, p.lat])
+      drawRouteWithOutline(straightPath)
+      endSegmentGroup()
+      if (sessionId === planSessionId) {
+        const allOverlays = [...markers, ...routeLayers]
+        if (allOverlays.length > 0) {
+          m.setFitView(allOverlays, false, [80, 80, 80, 80])
+        }
+        await animateRoute(sessionId)
+      }
     }
   } finally {
     if (sessionId === planSessionId) {
@@ -554,14 +1189,14 @@ function retry(): void {
 // ========== 监听器 ==========
 
 // 监听 points 变化，重新创建标记和路线
+// 浅监听即可：父组件的 mapPoints 是 computed，每次 routeOrder/activeDay 变化都返回全新数组引用
 watch(
   () => props.points,
   () => {
     if (!map.value || !AMap.value) return
     createMarkers()
     planRoute()
-  },
-  { deep: true }
+  }
 )
 
 // 监听 transport prop 变化，只重新规划路线（不重新创建标记）
@@ -580,7 +1215,7 @@ onMounted(() => {
 })
 
 onBeforeUnmount(() => {
-  // 取消所有进行中的规划请求
+  // 取消所有进行中的规划请求和动画
   planSessionId++
   const m = map.value
   if (m) {
@@ -589,7 +1224,10 @@ onBeforeUnmount(() => {
   }
   markers = []
   routeLayers = []
+  routeSegmentGroups = []
+  currentSegmentGroup = null
   infoWindow = null
+  crossDayLineRef.value = null
 })
 </script>
 

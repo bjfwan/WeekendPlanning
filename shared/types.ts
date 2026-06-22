@@ -46,6 +46,7 @@ export interface UserAIConfig {
 
 /** 单个行程项 */
 export interface PlanItem {
+  id: string // 稳定唯一标识（用于前端匹配）
   time: string
   endTime?: string
   title: string
@@ -67,6 +68,8 @@ export interface DayPlan {
   date: string
   items: PlanItem[]
   totalCost: number
+  /** 原始时间顺序的 items（路线重排前保存，供前端切换显示） */
+  originalItems?: PlanItem[]
 }
 
 /** 天气信息 */
@@ -94,6 +97,8 @@ export interface Plan {
   budget: number
   checklist: PlanChecklist
   weather?: WeatherInfo
+  /** 生成时使用的交通方式，供详情页恢复展示 */
+  transport?: TransportMode
 }
 
 // ========== SSE 事件 ==========

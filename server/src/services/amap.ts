@@ -73,6 +73,35 @@ export async function geocode(city: string): Promise<{ adcode: string }> {
 }
 
 /**
+ * 地理编码：返回完整信息（包括坐标）
+ * 与 geocode 的区别：geocode 只返回 adcode，本函数返回 location
+ */
+export async function geocodeWithLocation(
+  address: string
+): Promise<{ lng: number; lat: number; adcode: string } | null> {
+  try {
+    const data = await amapRequest<{
+      status?: string
+      geocodes?: Array<{ location?: string; adcode?: string }>
+    }>('/geocode/geo', { address })
+    if (data.status !== '1') return null
+    const geo = data.geocodes?.[0]
+    if (!geo?.location) return null
+    const parts = geo.location.split(',').map(Number)
+    if (parts.length !== 2 || Number.isNaN(parts[0]) || Number.isNaN(parts[1])) {
+      return null
+    }
+    return {
+      lng: parts[0],
+      lat: parts[1],
+      adcode: geo.adcode ?? ''
+    }
+  } catch {
+    return null
+  }
+}
+
+/**
  * 查询城市天气（含预报）
  * @param city 城市名
  */
@@ -141,8 +170,15 @@ function buildWeatherSuggestion(weather: string, wind: string, power: string): s
  * POI 搜索
  * @param keyword 关键词（如 "故宫"）
  * @param city 城市名
+ * @param limit 返回条数，默认 5，最多 20
  */
-export async function searchPOI(keyword: string, city: string): Promise<POI[]> {
+export async function searchPOI(
+  keyword: string,
+  city: string,
+  limit: number = 5
+): Promise<POI[]> {
+  // 限制在 1-20 之间
+  const cappedLimit = Math.max(1, Math.min(20, Math.floor(limit)))
   const data = await amapRequest<{
     pois?: Array<{
       id: string
@@ -155,15 +191,15 @@ export async function searchPOI(keyword: string, city: string): Promise<POI[]> {
   }>('/place/text', {
     keywords: keyword,
     city,
-    offset: '5'
+    offset: String(cappedLimit)
   })
 
   return (data.pois || []).map((p) => ({
-    id: p.id,
-    name: p.name,
-    type: p.type,
-    address: p.address,
-    location: p.location,
-    tel: p.tel
+    id: p.id ?? '',
+    name: p.name ?? '',
+    type: p.type ?? '',
+    address: p.address ?? '',
+    location: p.location ?? '',
+    tel: p.tel ?? ''
   }))
 }
