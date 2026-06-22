@@ -107,6 +107,45 @@ export async function fetchMembers(code: string): Promise<PlanPreferenceRecord[]
 }
 
 /**
+ * 删除行程
+ * @param code 分享码
+ */
+export async function deletePlan(code: string): Promise<void> {
+  await request<{ planId: string }>(`${API_BASE}/api/plan/${code}`, {
+    method: 'DELETE'
+  })
+}
+
+/**
+ * 编辑行程（修改标题/状态）
+ * @param code 分享码
+ * @param updates 更新字段
+ */
+export async function updatePlan(
+  code: string,
+  updates: { title?: string; status?: string }
+): Promise<void> {
+  await request<{ plan: PlanRecord }>(`${API_BASE}/api/plan/${code}`, {
+    method: 'PUT',
+    body: JSON.stringify(updates)
+  })
+}
+
+/**
+ * 批量获取行程的加入成员数
+ * @param userId 当前匿名用户 id
+ * @returns { [planId]: number } 映射
+ */
+export async function fetchMemberCounts(
+  userId: string
+): Promise<Record<string, number>> {
+  const data = await request<{ counts: Record<string, number> }>(
+    `${API_BASE}/api/plan/member-counts?userId=${encodeURIComponent(userId)}`
+  )
+  return data.counts
+}
+
+/**
  * 订阅 plan_preferences 表的实时新增事件
  * @param code 分享码（用于标识订阅频道）
  * @param planId 行程 id（用于按 plan_id 过滤，避免收到全表事件）

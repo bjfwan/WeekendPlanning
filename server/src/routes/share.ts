@@ -163,6 +163,65 @@ shareRouter.get('/history', async (req, res) => {
 })
 
 /**
+ * GET /api/plan/member-counts
+ * 批量获取用户所有行程的成员数映射，避免"我的行程"页面逐个查询
+ * query: userId - 当前用户 id
+ * 返回: { counts: Record<planId, number> }
+ */
+shareRouter.get('/member-counts', async (req, res) => {
+  try {
+    const userId = req.user?.id || (req.query.userId as string | undefined)
+
+    if (!userId) {
+      res.status(400).json({ success: false, error: '缺少 userId 参数' })
+      return
+    }
+
+    // 1. 查询用户所有行程的 id
+    const { data: plans, error: plansError } = await supabaseAdmin
+      .from('plans')
+      .select('id')
+      .eq('user_id', userId)
+
+    if (plansError) {
+      throw new Error(`查询用户行程失败: ${plansError.message}`)
+    }
+
+    if (!plans || plans.length === 0) {
+      res.json({ success: true, data: { counts: {} } })
+      return
+    }
+
+    const planIds = plans.map((p) => p.id)
+
+    // 2. 批量查询这些行程的协同成员（仅取 plan_id 字段减少传输量）
+    const { data: prefs, error: prefsError } = await supabaseAdmin
+      .from('plan_preferences')
+      .select('plan_id')
+      .in('plan_id', planIds)
+
+    if (prefsError) {
+      throw new Error(`查询成员数失败: ${prefsError.message}`)
+    }
+
+    // 3. 客户端聚合统计，确保未加入成员的行程也返回 0
+    const counts: Record<string, number> = {}
+    for (const id of planIds) {
+      counts[id] = 0
+    }
+    for (const pref of prefs || []) {
+      counts[pref.plan_id] = (counts[pref.plan_id] || 0) + 1
+    }
+
+    res.json({ success: true, data: { counts } })
+  } catch (err) {
+    const message = err instanceof Error ? err.message : '批量查询成员数失败'
+    console.error('[plan/member-counts] 错误:', message)
+    res.status(500).json({ success: false, error: message })
+  }
+})
+
+/**
  * GET /api/plan/:code
  * 通过分享码获取行程
  */
@@ -294,6 +353,194 @@ shareRouter.get('/:code/members', async (req, res) => {
   } catch (err) {
     const message = err instanceof Error ? err.message : '查询成员失败'
     console.error('[plan/:code/members] 错误:', message)
+    res.status(500).json({ success: false, error: message })
+  }
+})
+
+/**
+ * GET /api/plan/:code/member-count
+ * 获取行程的协同成员数量（轻量接口，仅返回计数）
+ */
+shareRouter.get('/:code/member-count', async (req, res) => {
+  try {
+    const { code } = req.params
+
+    // 先找到 plan_id
+    const { data: plan, error: planError } = await supabaseAdmin
+      .from('plans')
+      .select('id')
+      .eq('share_code', code)
+      .maybeSingle()
+
+    if (planError) {
+      throw new Error(`查询行程失败: ${planError.message}`)
+    }
+
+    if (!plan) {
+      res.status(404).json({ success: false, error: '行程不存在或分享码无效' })
+      return
+    }
+
+    // 使用 head:true 仅获取计数，不拉取实际数据
+    const { count, error: countError } = await supabaseAdmin
+      .from('plan_preferences')
+      .select('*', { count: 'exact', head: true })
+      .eq('plan_id', plan.id)
+
+    if (countError) {
+      throw new Error(`查询成员数失败: ${countError.message}`)
+    }
+
+    res.json({
+      success: true,
+      data: { planId: plan.id, count: count || 0 }
+    })
+  } catch (err) {
+    const message = err instanceof Error ? err.message : '查询成员数失败'
+    console.error('[plan/:code/member-count] 错误:', message)
+    res.status(500).json({ success: false, error: message })
+  }
+})
+
+/**
+ * DELETE /api/plan/:code
+ * 删除行程（同时级联删除关联的 plan_preferences 记录）
+ * query/body: userId - 行程所有者 id（用于权限校验）
+ */
+shareRouter.delete('/:code', async (req, res) => {
+  try {
+    const { code } = req.params
+    const bodyUserId = (req.body as { userId?: string } | undefined)?.userId
+    const userId = req.user?.id || (req.query.userId as string | undefined) || bodyUserId
+
+    if (!userId) {
+      res.status(400).json({ success: false, error: '缺少 userId' })
+      return
+    }
+
+    // 查询行程并校验归属
+    const { data: plan, error: planError } = await supabaseAdmin
+      .from('plans')
+      .select('id, user_id')
+      .eq('share_code', code)
+      .maybeSingle()
+
+    if (planError) {
+      throw new Error(`查询行程失败: ${planError.message}`)
+    }
+
+    if (!plan) {
+      res.status(404).json({ success: false, error: '行程不存在或分享码无效' })
+      return
+    }
+
+    if (plan.user_id !== userId) {
+      res.status(403).json({ success: false, error: '无权删除该行程' })
+      return
+    }
+
+    // 先删除关联的协同成员记录
+    const { error: prefDeleteError } = await supabaseAdmin
+      .from('plan_preferences')
+      .delete()
+      .eq('plan_id', plan.id)
+
+    if (prefDeleteError) {
+      throw new Error(`删除协同成员失败: ${prefDeleteError.message}`)
+    }
+
+    // 再删除行程本身
+    const { error: planDeleteError } = await supabaseAdmin
+      .from('plans')
+      .delete()
+      .eq('id', plan.id)
+
+    if (planDeleteError) {
+      throw new Error(`删除行程失败: ${planDeleteError.message}`)
+    }
+
+    res.json({ success: true, data: { planId: plan.id } })
+  } catch (err) {
+    const message = err instanceof Error ? err.message : '删除行程失败'
+    console.error('[plan/:code DELETE] 错误:', message)
+    res.status(500).json({ success: false, error: message })
+  }
+})
+
+/**
+ * PUT /api/plan/:code
+ * 编辑行程（支持修改 title、status、plan_data、city、date、budget 等字段）
+ * body: { userId, title?, status?, plan_data?, city?, date?, budget? }
+ */
+shareRouter.put('/:code', async (req, res) => {
+  try {
+    const { code } = req.params
+    const { userId: bodyUserId, ...updates } = req.body as {
+      userId?: string
+      title?: string
+      status?: 'draft' | 'active' | 'completed'
+      plan_data?: Plan
+      city?: string
+      date?: string
+      budget?: number
+    }
+    const userId = req.user?.id || bodyUserId
+
+    if (!userId) {
+      res.status(400).json({ success: false, error: '缺少 userId' })
+      return
+    }
+
+    // 查询行程并校验归属
+    const { data: plan, error: planError } = await supabaseAdmin
+      .from('plans')
+      .select('id, user_id')
+      .eq('share_code', code)
+      .maybeSingle()
+
+    if (planError) {
+      throw new Error(`查询行程失败: ${planError.message}`)
+    }
+
+    if (!plan) {
+      res.status(404).json({ success: false, error: '行程不存在或分享码无效' })
+      return
+    }
+
+    if (plan.user_id !== userId) {
+      res.status(403).json({ success: false, error: '无权编辑该行程' })
+      return
+    }
+
+    // 构建更新字段（仅更新客户端实际提交的字段）
+    const updateFields: Record<string, unknown> = {}
+    if (updates.title !== undefined) updateFields.title = updates.title
+    if (updates.status !== undefined) updateFields.status = updates.status
+    if (updates.plan_data !== undefined) updateFields.plan_data = updates.plan_data
+    if (updates.city !== undefined) updateFields.city = updates.city
+    if (updates.date !== undefined) updateFields.date = updates.date
+    if (updates.budget !== undefined) updateFields.budget = updates.budget
+
+    if (Object.keys(updateFields).length === 0) {
+      res.status(400).json({ success: false, error: '没有需要更新的字段' })
+      return
+    }
+
+    const { data: updated, error: updateError } = await supabaseAdmin
+      .from('plans')
+      .update(updateFields)
+      .eq('id', plan.id)
+      .select('*')
+      .single()
+
+    if (updateError) {
+      throw new Error(`更新行程失败: ${updateError.message}`)
+    }
+
+    res.json({ success: true, data: { plan: updated as PlanRecord } })
+  } catch (err) {
+    const message = err instanceof Error ? err.message : '更新行程失败'
+    console.error('[plan/:code PUT] 错误:', message)
     res.status(500).json({ success: false, error: message })
   }
 })

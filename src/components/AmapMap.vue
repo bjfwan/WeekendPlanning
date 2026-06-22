@@ -4,6 +4,7 @@
  * - 数字标记（起点 coral / 中间 amber / 终点 mint），上方显示时间
  * - 路线规划（公交 / 自驾 / 步行 / 直线），含白色描边 + coral 主线
  * - 交通方式切换浮层（右上角，规划中显示 loading）
+ * - 公交/地铁信息面板（左下角，区分地铁/公交/步行）
  * - 暴露 focusPoint 方法（聚焦 + InfoWindow + 弹跳动画）
  */
 import { ref, shallowRef, onMounted, onBeforeUnmount, watch } from 'vue'
@@ -22,10 +23,26 @@ interface RouteSegment {
   name?: string
 }
 
-/** 可动画的路线层（记录目标透明度，用于逐段显示动画） */
+/** 可动画的路线层（记录完整路径，用于渐进式绘制动画） */
 interface AnimatableLayer {
   layer: any
   targetOpacity: number
+  /** 完整路径点数组，动画中逐步截取显示 */
+  fullPath: any[]
+}
+
+/** 公交/地铁路线信息组（用于信息面板展示） */
+interface TransitInfoGroup {
+  /** 起点标记索引 */
+  fromIndex: number
+  /** 终点标记索引 */
+  toIndex: number
+  /** 该段路线的交通方式明细 */
+  items: Array<{
+    type: 'transit' | 'walking'
+    mode?: string
+    name?: string
+  }>
 }
 
 interface Props {
@@ -62,6 +79,8 @@ const errorMsg = ref<string | null>(null)
 const currentTransport = ref<TransportMode>(props.transport)
 /** 路线规划中（用于按钮 loading） */
 const planning = ref(false)
+/** 路线交通方式信息（仅 public 模式有值，用于信息面板） */
+const transitInfo = ref<TransitInfoGroup[]>([])
 
 // ========== 内部实例（shallowRef 避免深度代理 AMap 大对象） ==========
 const AMap = shallowRef<any>(null)
@@ -87,6 +106,8 @@ let currentSegmentGroup: AnimatableLayer[] | null = null
 const COLOR_CORAL = '#FF6B6B'
 const COLOR_AMBER = '#FFD93D'
 const COLOR_MINT = '#4ECDC4'
+const COLOR_SUBWAY = '#3B82F6'
+const COLOR_WALK = '#999999'
 
 // ========== 交通方式选项 ==========
 const transportOptions: TransportOption[] = [
@@ -323,12 +344,13 @@ function clearRoute(): void {
   routeLayers = []
   routeSegmentGroups = []
   currentSegmentGroup = null
+  transitInfo.value = []
 }
 
 /**
  * 开始一个新的分段组（用于逐段路线动画）
  * 在 startSegmentGroup / endSegmentGroup 之间创建的路线层会被追踪，
- * 创建后立即设为透明，等待 animateRoute 逐段显示。
+ * 创建后立即设为单点路径（不可见），等待 animateRoute 渐进式绘制。
  */
 function startSegmentGroup(): void {
   currentSegmentGroup = []
@@ -346,12 +368,16 @@ function endSegmentGroup(): void {
 
 /**
  * 将路线层加入当前分段组（用于动画追踪）
- * 在分组模式下，创建后立即设为透明，等待 animateRoute 逐段显示
+ * 在分组模式下，创建后立即将路径设为单点（不渲染线段），等待 animateRoute 渐进式绘制
  */
-function trackLayer(layer: any, targetOpacity: number): void {
+function trackLayer(layer: any, targetOpacity: number, path: any[]): void {
   if (currentSegmentGroup) {
-    currentSegmentGroup.push({ layer, targetOpacity })
-    layer.setOptions({ strokeOpacity: 0 })
+    currentSegmentGroup.push({ layer, targetOpacity, fullPath: path })
+    // 初始只显示第一个点（单点不渲染线段），路径在动画中渐进增长
+    layer.setOptions({
+      strokeOpacity: targetOpacity,
+      path: path.length > 0 ? [path[0]] : []
+    })
   }
 }
 
@@ -408,7 +434,7 @@ function drawRouteWithOutline(path: any[]): void {
   })
   m.add(outline)
   routeLayers.push(outline)
-  trackLayer(outline, 1)
+  trackLayer(outline, 1, path)
   // coral 主线（细线，画在描边之上）
   const main = new amap.Polyline({
     path,
@@ -422,7 +448,7 @@ function drawRouteWithOutline(path: any[]): void {
   })
   m.add(main)
   routeLayers.push(main)
-  trackLayer(main, 0.9)
+  trackLayer(main, 0.9, path)
 }
 
 /**
@@ -443,12 +469,12 @@ function drawTransitRoute(segments: RouteSegment[]): void {
     let opacity = 0.9
 
     if (seg.type === 'walking') {
-      color = '#999'
+      color = COLOR_WALK
       weight = 2
       style = 'dashed'
       opacity = 0.6
     } else if (seg.mode === 'SUBWAY') {
-      color = '#3B82F6' // 蓝色 - 地铁
+      color = COLOR_SUBWAY // 蓝色 - 地铁
       weight = 5
     } else if (seg.mode === 'BUS') {
       color = COLOR_CORAL // coral - 公交
@@ -467,7 +493,7 @@ function drawTransitRoute(segments: RouteSegment[]): void {
     })
     m.add(polyline)
     routeLayers.push(polyline)
-    trackLayer(polyline, opacity)
+    trackLayer(polyline, opacity, seg.path)
   }
 }
 
@@ -478,11 +504,12 @@ function drawDashedLine(start: MapPoint, end: MapPoint): void {
   const amap = AMap.value
   const m = map.value
   if (!amap || !m) return
+  const path = [
+    [start.lng, start.lat],
+    [end.lng, end.lat]
+  ]
   const line = new amap.Polyline({
-    path: [
-      [start.lng, start.lat],
-      [end.lng, end.lat]
-    ],
+    path,
     strokeColor: COLOR_CORAL,
     strokeWeight: 4,
     strokeOpacity: 0.7,
@@ -494,7 +521,7 @@ function drawDashedLine(start: MapPoint, end: MapPoint): void {
   })
   m.add(line)
   routeLayers.push(line)
-  trackLayer(line, 0.7)
+  trackLayer(line, 0.7, path)
 }
 
 /**
@@ -631,6 +658,7 @@ function searchSegmentPath(
 
 /**
  * 公交模式专用：规划单段路线并返回分段信息（区分公交/地铁/步行）
+ * 兼容高德 API 不同版本：transit 或 bus 字段，transit_mode 或 type 字段
  * @returns 成功返回 RouteSegment[]，失败返回 null
  */
 function searchTransitSegments(
@@ -687,12 +715,32 @@ function searchTransitSegments(
           }
           const segments: RouteSegment[] = []
           for (const seg of (plan.segments || [])) {
-            if (seg.transit?.path && seg.transit.path.length > 0) {
+            // 兼容不同 API 版本：transit 或 bus 字段
+            const transit = seg.transit || seg.bus
+            if (transit?.path && transit.path.length > 0) {
+              // 解析交通方式：优先 transit_mode（英文），其次 type（中文），最后从 name 推断
+              const rawMode = transit.transit_mode || transit.type || ''
+              const name = transit.name || ''
+              let mode = 'BUS'
+              if (
+                rawMode === 'SUBWAY' ||
+                rawMode === '地铁' ||
+                String(rawMode).includes('地铁') ||
+                name.includes('地铁')
+              ) {
+                mode = 'SUBWAY'
+              } else if (
+                rawMode === 'BUS' ||
+                rawMode === '公交' ||
+                String(rawMode).includes('公交')
+              ) {
+                mode = 'BUS'
+              }
               segments.push({
-                path: seg.transit.path,
+                path: transit.path,
                 type: 'transit',
-                mode: seg.transit.transit_mode, // 'BUS' or 'SUBWAY'
-                name: seg.transit.name
+                mode,
+                name
               })
             } else if (seg.walking?.path && seg.walking.path.length > 0) {
               segments.push({
@@ -866,61 +914,160 @@ function splitPathByPoints(path: any[], points: MapPoint[]): any[][] {
 }
 
 /**
+ * 渐进式动画显示单段路线
+ * - 使用 requestAnimationFrame 实现流畅的路径绘制（非透明度切换）
+ * - 路径从起点开始逐步增长，模拟"绘制"效果
+ * - 使用 easeInOutQuad 缓动函数让动画更自然
+ * - 每层按各自 fullPath 的比例截取，同步推进
+ */
+function animateSegmentGroup(
+  group: AnimatableLayer[],
+  duration: number,
+  sessionId: number
+): Promise<void> {
+  const maxPathLength = Math.max(...group.map((l) => l.fullPath.length), 0)
+
+  // 路径太短，直接显示
+  if (maxPathLength < 2) {
+    for (const { layer, targetOpacity } of group) {
+      layer.setOptions({ strokeOpacity: targetOpacity })
+    }
+    return Promise.resolve()
+  }
+
+  return new Promise((resolve) => {
+    const startTime = performance.now()
+
+    const step = (now: number): void => {
+      if (sessionId !== planSessionId) {
+        resolve()
+        return
+      }
+
+      const elapsed = now - startTime
+      const progress = Math.min(1, elapsed / duration)
+
+      // easeInOutQuad 缓动：起步慢、中间快、收尾慢，视觉更自然
+      const eased =
+        progress < 0.5
+          ? 2 * progress * progress
+          : 1 - Math.pow(-2 * progress + 2, 2) / 2
+
+      // 更新每层的路径（按各自 fullPath 的比例截取）
+      for (const { layer, fullPath, targetOpacity } of group) {
+        if (fullPath.length < 2) {
+          layer.setOptions({ strokeOpacity: targetOpacity })
+          continue
+        }
+        const pointCount = Math.max(2, Math.ceil(eased * fullPath.length))
+        layer.setOptions({
+          path: fullPath.slice(0, pointCount),
+          strokeOpacity: targetOpacity
+        })
+      }
+
+      if (progress < 1) {
+        requestAnimationFrame(step)
+      } else {
+        resolve()
+      }
+    }
+
+    requestAnimationFrame(step)
+  })
+}
+
+/**
  * 逐段动画显示路线 + 逐个激活标记点
- * - 先激活起点标记
- * - 逐段显示路线（strokeOpacity 0 → 目标值）
- * - 每段显示后激活下一个标记
- * - 总时长控制在 2-3 秒内（每段约 300ms + 标记 100ms）
+ * - 先展示全景视野（让用户看到整体路线）
+ * - 每段绘制前平滑过渡视角到该段范围（setFitView immediately=false 带动画）
+ * - 使用 requestAnimationFrame 渐进式绘制路径（路径从起点逐步增长）
+ * - 每段绘制后激活下一个标记
+ * - 全部完成后恢复全景视野
  * - 通过 sessionId 检查取消旧动画
  */
 async function animateRoute(sessionId: number): Promise<void> {
+  const m = map.value
   const totalSegments = routeSegmentGroups.length
   const totalMarkers = markers.length
 
-  if (totalMarkers === 0) return
+  if (totalMarkers === 0 || !m) return
 
   // 没有路线段：直接逐个激活标记
   if (totalSegments === 0) {
+    const allOverlays = [...markers]
+    if (allOverlays.length > 0) {
+      m.setFitView(allOverlays, false, [80, 80, 80, 80])
+    }
     for (let i = 0; i < totalMarkers; i++) {
       if (sessionId !== planSessionId) return
       activateMarker(i)
-      await new Promise((resolve) => setTimeout(resolve, 150))
+      await new Promise((resolve) => setTimeout(resolve, 200))
     }
     return
   }
 
+  // 初始：展示全景视野（让用户先看到整体路线概况）
+  const allOverlays = [...markers, ...routeLayers]
+  if (allOverlays.length > 0) {
+    m.setFitView(allOverlays, false, [80, 80, 80, 80])
+  }
+  await new Promise((resolve) => setTimeout(resolve, 400))
+
   // 激活起点标记
   activateMarker(0)
-  await new Promise((resolve) => setTimeout(resolve, 200))
+  await new Promise((resolve) => setTimeout(resolve, 300))
 
-  // 逐段显示路线 + 激活下一个标记
+  // 逐段渐进式绘制
   for (let i = 0; i < totalSegments; i++) {
     if (sessionId !== planSessionId) return
 
-    // 显示第 i 段路线
     const group = routeSegmentGroups[i]
-    for (const { layer, targetOpacity } of group) {
-      layer.setOptions({ strokeOpacity: targetOpacity })
-    }
 
+    // 平滑过渡视角到当前段（含起终点标记，maxZoom 防止过度放大）
+    const groupLayers = group.map((g) => g.layer)
+    const segmentOverlays = [...groupLayers]
+    if (i < markers.length) segmentOverlays.push(markers[i])
+    if (i + 1 < markers.length) segmentOverlays.push(markers[i + 1])
+    if (segmentOverlays.length > 0) {
+      m.setFitView(segmentOverlays, false, [120, 120, 120, 120], 16)
+    }
+    // 等待视角过渡动画完成
     await new Promise((resolve) => setTimeout(resolve, 300))
 
     if (sessionId !== planSessionId) return
 
-    // 激活第 i+1 个标记
+    // 根据路径长度计算动画时长（更慢、更清晰）
+    // 基础 800ms，每点 +10ms，上限 1800ms
+    const maxPathLength = Math.max(...group.map((l) => l.fullPath.length), 0)
+    const duration = Math.min(1800, Math.max(800, maxPathLength * 10))
+
+    // 渐进式绘制路径
+    await animateSegmentGroup(group, duration, sessionId)
+
+    if (sessionId !== planSessionId) return
+
+    // 激活下一个标记
     if (i + 1 < totalMarkers) {
       activateMarker(i + 1)
-      await new Promise((resolve) => setTimeout(resolve, 100))
+      await new Promise((resolve) => setTimeout(resolve, 250))
     }
+  }
+
+  // 最终：恢复全景视野
+  if (sessionId !== planSessionId) return
+  const finalOverlays = [...markers, ...routeLayers]
+  if (finalOverlays.length > 0) {
+    m.setFitView(finalOverlays, false, [80, 80, 80, 80])
   }
 }
 
 /**
  * 规划完整路线
- * - public 模式：分段规划，区分公交/地铁/步行样式
+ * - public 模式：分段规划，区分公交/地铁/步行样式，收集交通方式信息
  * - driving/mixed 模式且点数 > 2：优先用途径点一次性规划，失败回退分段规划
  * - walking 模式：直接用分段规划（AMap.Walking 不支持 waypoints 参数，传入会卡住不回调）
- * - 规划完成后调用 animateRoute 逐段显示路线 + 逐个激活标记
+ * - 规划完成后调用 animateRoute 渐进式绘制路线 + 逐个激活标记
  */
 async function planRoute(): Promise<void> {
   const m = map.value
@@ -968,12 +1115,9 @@ async function planRoute(): Promise<void> {
           drawRouteWithOutline(subPath)
           endSegmentGroup()
         }
-        // 规划完成后自适应视野（包含标记和路线）+ 逐段动画
+        transitInfo.value = []
+        // 逐段动画（含视角过渡）
         if (sessionId === planSessionId) {
-          const allOverlays = [...markers, ...routeLayers]
-          if (allOverlays.length > 0) {
-            m.setFitView(allOverlays, false, [80, 80, 80, 80])
-          }
           await animateRoute(sessionId)
         }
         return
@@ -1046,20 +1190,38 @@ async function planRoute(): Promise<void> {
         }
         endSegmentGroup()
       })
+
+      // 收集公交/地铁信息（用于信息面板）
+      if (isPublic) {
+        const info: TransitInfoGroup[] = []
+        segmentResults.forEach((r, idx) => {
+          if (r.segments) {
+            info.push({
+              fromIndex: idx,
+              toIndex: idx + 1,
+              items: r.segments.map((s) => ({
+                type: s.type,
+                mode: s.mode,
+                name: s.name
+              }))
+            })
+          }
+        })
+        transitInfo.value = info
+      } else {
+        transitInfo.value = []
+      }
     } else {
       // 成功率 < 50%：全部回退为直线折线，避免实线-虚线混杂
       startSegmentGroup()
       const straightPath = props.points.map((p) => [p.lng, p.lat])
       drawRouteWithOutline(straightPath)
       endSegmentGroup()
+      transitInfo.value = []
     }
 
-    // 规划完成后自适应视野（包含标记和路线）+ 逐段动画
+    // 逐段动画（含视角过渡）
     if (sessionId === planSessionId) {
-      const allOverlays = [...markers, ...routeLayers]
-      if (allOverlays.length > 0) {
-        m.setFitView(allOverlays, false, [80, 80, 80, 80])
-      }
       await animateRoute(sessionId)
     }
   } catch (e) {
@@ -1069,11 +1231,8 @@ async function planRoute(): Promise<void> {
       const straightPath = props.points.map((p) => [p.lng, p.lat])
       drawRouteWithOutline(straightPath)
       endSegmentGroup()
+      transitInfo.value = []
       if (sessionId === planSessionId) {
-        const allOverlays = [...markers, ...routeLayers]
-        if (allOverlays.length > 0) {
-          m.setFitView(allOverlays, false, [80, 80, 80, 80])
-        }
         await animateRoute(sessionId)
       }
     }
@@ -1093,6 +1252,27 @@ async function switchTransport(mode: TransportMode): Promise<void> {
   if (currentTransport.value === mode || planning.value) return
   currentTransport.value = mode
   await planRoute()
+}
+
+// ========== 信息面板辅助函数 ==========
+
+/**
+ * 获取交通方式段的颜色（用于信息面板圆点）
+ */
+function getSegmentColor(item: { type: string; mode?: string }): string {
+  if (item.type === 'walking') return COLOR_WALK
+  if (item.mode === 'SUBWAY') return COLOR_SUBWAY
+  return COLOR_CORAL
+}
+
+/**
+ * 获取交通方式段的图标和标签（用于信息面板文本）
+ */
+function getSegmentLabel(item: { type: string; mode?: string; name?: string }): string {
+  if (item.type === 'walking') return '🚶 步行'
+  if (item.mode === 'SUBWAY') return `🚇 ${item.name || '地铁'}`
+  if (item.mode === 'BUS') return `🚌 ${item.name || '公交'}`
+  return item.name || 'transit'
 }
 
 // ========== focusPoint 方法 ==========
@@ -1228,6 +1408,7 @@ onBeforeUnmount(() => {
   currentSegmentGroup = null
   infoWindow = null
   crossDayLineRef.value = null
+  transitInfo.value = []
 })
 </script>
 
@@ -1296,6 +1477,39 @@ onBeforeUnmount(() => {
         <span v-else>{{ opt.icon }}</span>
         <span>{{ opt.label }}</span>
       </button>
+    </div>
+
+    <!-- 路线信息面板（仅 public 模式显示，区分地铁/公交/步行） -->
+    <div
+      v-if="!loading && !errorMsg && currentTransport === 'public' && transitInfo.length > 0"
+      class="absolute bottom-3 left-3 z-10 max-w-[220px] max-h-[60%] overflow-y-auto p-3 bg-white/90 backdrop-blur-md rounded-xl shadow-card"
+    >
+      <div class="text-xs font-bold text-navy mb-2 flex items-center gap-1">
+        <span>🚍</span>
+        <span>路线详情</span>
+      </div>
+      <div class="flex flex-col gap-2">
+        <div
+          v-for="group in transitInfo"
+          :key="group.fromIndex"
+          class="flex flex-col gap-1"
+        >
+          <div class="text-[10px] text-navy/50 font-semibold">
+            第{{ group.fromIndex + 1 }}站 → 第{{ group.toIndex + 1 }}站
+          </div>
+          <div
+            v-for="(item, idx) in group.items"
+            :key="idx"
+            class="flex items-center gap-1.5 text-xs"
+          >
+            <span
+              class="w-2.5 h-2.5 rounded-full flex-shrink-0"
+              :style="{ background: getSegmentColor(item) }"
+            />
+            <span class="text-navy/80">{{ getSegmentLabel(item) }}</span>
+          </div>
+        </div>
+      </div>
     </div>
   </div>
 </template>
