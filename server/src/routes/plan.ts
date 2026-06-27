@@ -413,6 +413,10 @@ planRouter.post('/generate', async (req, res) => {
   try {
     const body = req.body as GeneratePlanRequest
 
+    // 校验 people：确保是 >=1 的有效数字
+    const peopleNum = Number(body.people)
+    body.people = Number.isFinite(peopleNum) && peopleNum >= 1 ? Math.min(peopleNum, 10) : 1
+
     // 设置 SSE 响应头
     res.writeHead(200, {
       'Content-Type': 'text/event-stream',

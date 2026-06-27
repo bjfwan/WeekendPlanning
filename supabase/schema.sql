@@ -21,7 +21,7 @@ create table if not exists public.plans (
   duration    text not null default '1-day'
                 check (duration in ('half-day', '1-day', '2-day', '3-day')),
   budget      numeric not null default 0,
-  people      integer not null default 0,
+  people      integer not null default 1 check (people >= 1),
   preferences text[] not null default '{}',
   transport   text not null default 'public'
                 check (transport in ('public', 'driving', 'walking', 'mixed')),

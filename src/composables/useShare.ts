@@ -2,7 +2,7 @@
  * 行程分享相关 composable
  * 封装行程保存、按分享码查询、加入协同、成员订阅等能力
  */
-import type { Plan, PlanPreferenceRecord, PlanRecord } from '@weekend-planner/shared'
+import type { GeneratePlanRequest, Plan, PlanPreferenceRecord, PlanRecord } from '@weekend-planner/shared'
 import { supabase } from '@/lib/supabase'
 
 /** API 基础地址，未配置时使用相对路径（依赖 Vite 代理） */
@@ -88,11 +88,12 @@ export async function fetchMyPlans(userId: string): Promise<PlanRecord[]> {
  */
 export async function savePlan(
   plan: Plan,
-  userId: string
+  userId: string,
+  planRequest?: GeneratePlanRequest
 ): Promise<SavePlanResponseData> {
   return request<SavePlanResponseData>(`${API_BASE}/api/plan/save`, {
     method: 'POST',
-    body: JSON.stringify({ plan, userId })
+    body: JSON.stringify({ plan, userId, request: planRequest })
   })
 }
 

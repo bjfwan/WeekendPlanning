@@ -919,7 +919,7 @@ onBeforeUnmount(() => {
                 </span>
                 <span class="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-xs font-medium bg-navy/5 text-navy/60">
                   <Users class="w-3 h-3" />
-                  {{ plan.people ?? 0 }} 人
+                  {{ plan.people && plan.people > 0 ? plan.people : 1 }} 人
                 </span>
                 <span class="inline-flex items-center px-2 py-0.5 rounded-full text-xs font-medium bg-coral/10 text-coral">
                   ✅ 已加入 {{ memberCounts[plan.id] ?? 0 }} 人

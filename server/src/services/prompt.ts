@@ -49,7 +49,8 @@ export function buildPlanPrompt(
   lines.push(`- 出发日期：${date}`)
   lines.push(`- 行程时长：${DURATION_LABEL[duration]}`)
   lines.push(`- 预算：${budget} 元（人民币）`)
-  lines.push(`- 人数：${people} 人`)
+  const safePeople = Number.isFinite(people) && people > 0 ? people : 1
+  lines.push(`- 人数：${safePeople} 人`)
   lines.push(`- 偏好：${preferences.join('、') || '不限'}`)
   lines.push(`- 出行方式：${TRANSPORT_LABEL[transport]}`)
 

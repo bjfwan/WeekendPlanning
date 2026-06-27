@@ -491,7 +491,7 @@ watch(status, async (newStatus) => {
           userId = user.value?.id
         }
         if (userId) {
-          const result = await savePlan(plan.value, userId)
+          const result = await savePlan(plan.value, userId, planRequest.value ?? undefined)
         } else {
           console.warn('[PlanView] 用户身份未就绪，跳过自动保存')
           showAutoSaveError('自动保存失败：用户身份未就绪，可点击"分享链接"重试')
@@ -630,7 +630,7 @@ async function handleShare() {
     if (!userId) {
       throw new Error('用户身份未就绪，请稍后重试')
     }
-    const { shareCode } = await savePlan(currentPlan.value, userId)
+    const { shareCode } = await savePlan(currentPlan.value, userId, planRequest.value ?? undefined)
     // 生成完整分享链接
     shareUrl.value = `${window.location.origin}/join/${shareCode}`
     // 记录行程信息用于弹窗展示
