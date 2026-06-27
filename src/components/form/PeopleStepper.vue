@@ -284,3 +284,108 @@ onBeforeUnmount(() => {
   stopPress()
 })
 </script>
+
+<template>
+  <div class="w-full" role="group" aria-label="人数选择">
+    <!-- 步进器主体：- [数字] + -->
+    <div class="flex items-center justify-center gap-5">
+      <!-- 减号按钮 -->
+      <button
+        ref="minusBtnRef"
+        type="button"
+        :disabled="isMin"
+        :aria-label="`减少人数，当前 ${displayNumber} 人`"
+        class="w-12 h-12 rounded-full inline-flex items-center justify-center border-2 outline-none cursor-pointer select-none transition-all duration-[200ms] ease-out focus-visible:ring-4 focus-visible:ring-coral/20 active:scale-95 disabled:cursor-not-allowed disabled:active:scale-100"
+        :class="isMin
+          ? 'bg-navy/5 text-navy/30 border-navy/10'
+          : 'bg-white text-navy border-navy/10 [@media(hover:hover)]:hover:border-coral/40 [@media(hover:hover)]:hover:bg-coral/5 [@media(hover:hover)]:hover:text-coral'"
+        @pointerdown="onPointerDown(-1)"
+        @pointerup="stopPress"
+        @pointerleave="stopPress"
+        @pointercancel="stopPress"
+        @click="onClick(-1)"
+        @blur="onBlur"
+      >
+        <Minus :size="22" />
+      </button>
+
+      <!-- 数字显示 -->
+      <div
+        class="flex items-baseline justify-center gap-1.5 min-w-[72px]"
+        role="status"
+      >
+        <span
+          ref="numberRef"
+          class="text-4xl font-bold text-navy tabular-nums leading-none"
+          aria-live="polite"
+          aria-atomic="true"
+          :aria-valuenow="displayNumber"
+          :aria-valuemin="min"
+          :aria-valuemax="max"
+        >{{ displayNumber }}</span>
+        <span class="text-sm font-medium text-navy/50">人</span>
+      </div>
+
+      <!-- 加号按钮 -->
+      <button
+        ref="plusBtnRef"
+        type="button"
+        :disabled="isMax"
+        :aria-label="`增加人数，当前 ${displayNumber} 人`"
+        class="w-12 h-12 rounded-full inline-flex items-center justify-center border-2 outline-none cursor-pointer select-none transition-all duration-[200ms] ease-out focus-visible:ring-4 focus-visible:ring-coral/20 active:scale-95 disabled:cursor-not-allowed disabled:active:scale-100"
+        :class="isMax
+          ? 'bg-navy/5 text-navy/30 border-navy/10'
+          : 'bg-coral text-white border-coral shadow-md [@media(hover:hover)]:hover:bg-coral/90 [@media(hover:hover)]:hover:shadow-lg'"
+        @pointerdown="onPointerDown(1)"
+        @pointerup="stopPress"
+        @pointerleave="stopPress"
+        @pointercancel="stopPress"
+        @click="onClick(1)"
+        @blur="onBlur"
+      >
+        <Plus :size="22" />
+      </button>
+    </div>
+
+    <!-- 边界提示（GSAP 控制入场/出场，不使用 Transition 避免冲突） -->
+    <p
+      v-if="hintVisible"
+      ref="hintRef"
+      class="mt-3 text-center text-sm text-coral font-medium"
+      aria-live="assertive"
+      role="status"
+    >
+      {{ boundaryHint }}
+    </p>
+
+    <!-- 错误提示 -->
+    <Transition
+      enter-active-class="transition-all duration-[150ms] ease-out"
+      enter-from-class="opacity-0 -translate-y-1"
+      enter-to-class="opacity-100 translate-y-0"
+      leave-active-class="transition-all duration-[100ms] ease-in"
+      leave-from-class="opacity-100 translate-y-0"
+      leave-to-class="opacity-0"
+    >
+      <p
+        v-if="error"
+        class="mt-2 text-coral text-sm flex items-center justify-center gap-1 min-w-0"
+        aria-live="polite"
+      >
+        <AlertCircle :size="16" class="shrink-0" />
+        <span class="truncate">{{ error }}</span>
+      </p>
+    </Transition>
+
+    <!-- 无障碍：当前值与范围描述 -->
+    <div class="sr-only" aria-live="polite" role="status">
+      当前 {{ displayNumber }} 人，范围 {{ min }} 到 {{ max }} 人
+    </div>
+
+    <!-- 无障碍：边界状态描述 -->
+    <div class="sr-only" aria-live="polite" role="status">
+      <span v-if="isMin">已达到最少人数</span>
+      <span v-else-if="isMax">已达到最多人数</span>
+    </div>
+  </div>
+</template>
