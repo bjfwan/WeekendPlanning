@@ -492,7 +492,6 @@ watch(status, async (newStatus) => {
         }
         if (userId) {
           const result = await savePlan(plan.value, userId)
-          console.log('[PlanView] 行程已自动保存，分享码:', result.shareCode)
         } else {
           console.warn('[PlanView] 用户身份未就绪，跳过自动保存')
           showAutoSaveError('自动保存失败：用户身份未就绪，可点击"分享链接"重试')

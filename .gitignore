@@ -7,8 +7,12 @@
 server/.env
 server/.env.*
 
-# 所有 Markdown 文档（可能含敏感信息，不提交）
-*.md
+# 敏感文档（含真实密钥，不入库）
+DEMO_PLAN.md
+*.local.md
+*.secret.md
+# Vercel 构建检查产物（含嵌入密钥）
+_vercel_check_*.js
 
 # 依赖
 node_modules/
@@ -53,6 +57,7 @@ coverage/
 *.tmp
 *.bak
 verceltizhi.txt
+_vercel_home.html
 
 # 锁文件（保留 pnpm-lock.yaml，忽略其他）
 package-lock.json
