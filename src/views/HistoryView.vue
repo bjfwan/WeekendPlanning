@@ -1,6 +1,6 @@
 <script setup lang="ts">
 /** 历史规划页 - 展示当前匿名账户下生成过的所有行程 */
-import { ref, computed, onMounted } from 'vue'
+import { ref, computed, onMounted, watch, nextTick, onBeforeUnmount } from 'vue'
 import { useRouter } from 'vue-router'
 import type { PlanRecord } from '@weekend-planner/shared'
 import BaseButton from '@/components/BaseButton.vue'
@@ -8,9 +8,15 @@ import BaseCard from '@/components/BaseCard.vue'
 import ShareModal from '@/components/ShareModal.vue'
 import { useAuth } from '@/composables/useAuth'
 import { fetchMyPlans, deletePlan, updatePlan, fetchMemberCounts } from '@/composables/useShare'
+import { BookOpen, RefreshCw, MapPin, Calendar, Clock, JapaneseYen, Users, Map as MapIcon } from '@lucide/vue'
+import { useGsap, EASE_OUT, EASE_IN_OUT, EASE_BACK } from '@/composables/useGsap'
 
 const router = useRouter()
 const { user, ensureSession } = useAuth()
+const { gsap, matchMedia, context } = useGsap()
+
+// 用 context 包装动画作用域，组件卸载时统一 revert
+context()
 
 // 模块级缓存（跨导航生效）：缓存行程列表与获取时间
 let cachedPlans: PlanRecord[] | null = null
@@ -51,9 +57,26 @@ const editingTitle = ref('')
 // 删除中状态
 const deletingPlanId = ref<string | null>(null)
 
+// === GSAP 动画相关状态 ===
+// 骨架屏可见性（独立于 loading，用于淡出过渡）
+const skeletonVisible = ref(loading.value)
+// Toast 可见性（独立于 toast 内容，用于出入场动画控制）
+const toastVisible = ref(false)
+// 标记是否首次渲染（首次用 stagger 入场，后续用 Flip 重排）
+let isFirstRender = true
+// 收集 matchMedia 实例用于卸载时清理
+const mmInstances: ReturnType<typeof matchMedia>[] = []
+
+// DOM 引用
+const cardsContainerRef = ref<HTMLElement | null>(null)
+const skeletonContainerRef = ref<HTMLElement | null>(null)
+const filterBarRef = ref<HTMLElement | null>(null)
+const refreshIconRef = ref<HTMLElement | null>(null)
+const toastRef = ref<HTMLElement | null>(null)
+
 // 状态徽章配置
 const statusConfig: Record<string, { label: string; bg: string; text: string }> = {
-  active: { label: '进行中', bg: 'bg-mint/15', text: 'text-mint' },
+  active: { label: '进行中', bg: 'bg-coral/15', text: 'text-coral' },
   completed: { label: '已完成', bg: 'bg-amber/20', text: 'text-amber' },
   draft: { label: '草稿', bg: 'bg-navy/10', text: 'text-navy/60' }
 }
@@ -249,18 +272,20 @@ async function handleDelete(plan: PlanRecord) {
   deletingPlanId.value = plan.id
   try {
     await deletePlan(plan.share_code)
-    // 从列表中移除
-    plans.value = plans.value.filter(p => p.id !== plan.id)
-    cachedPlans = plans.value
-    // 更新成员数缓存
-    const newCounts = { ...memberCounts.value }
-    delete newCounts[plan.id]
-    memberCounts.value = newCounts
-    if (cachedMemberCounts) {
-      const cached = { ...cachedMemberCounts }
-      delete cached[plan.id]
-      cachedMemberCounts = cached
-    }
+    // 先播放折叠动画，动画完成后再从数组移除
+    animateCardRemoval(plan.id, () => {
+      plans.value = plans.value.filter(p => p.id !== plan.id)
+      cachedPlans = plans.value
+      // 更新成员数缓存
+      const newCounts = { ...memberCounts.value }
+      delete newCounts[plan.id]
+      memberCounts.value = newCounts
+      if (cachedMemberCounts) {
+        const cached = { ...cachedMemberCounts }
+        delete cached[plan.id]
+        cachedMemberCounts = cached
+      }
+    })
     showToast('行程已删除')
   } catch (err) {
     showToast(err instanceof Error ? err.message : '删除失败')
@@ -273,6 +298,11 @@ async function handleDelete(plan: PlanRecord) {
 function startEdit(plan: PlanRecord) {
   editingPlanId.value = plan.id
   editingTitle.value = plan.title || ''
+  // 等待 DOM 更新后触发输入框展开动画
+  nextTick(() => {
+    const input = document.querySelector<HTMLInputElement>('[data-edit-input]')
+    if (input) animateEditExpand(input)
+  })
 }
 
 // 取消编辑
@@ -328,324 +358,642 @@ function goHome() {
   router.push({ name: 'home' })
 }
 
+// 刷新按钮点击：触发旋转动画 + 强制重新请求
+async function handleRefresh() {
+  animateRefreshIcon()
+  await loadPlans(true)
+}
+
+// === GSAP 动画函数 ===
+
+// 包装 matchMedia：收集实例便于卸载时清理
+function runMotion(setup: (isReduce: boolean) => void): void {
+  const mm = matchMedia((_ctx, isReduce) => setup(isReduce))
+  mmInstances.push(mm)
+}
+
+// 获取所有卡片 DOM 元素
+function getCardElements(): HTMLElement[] {
+  if (!cardsContainerRef.value) return []
+  return Array.from(cardsContainerRef.value.querySelectorAll('[data-card-id]'))
+}
+
+// 获取所有骨架屏元素
+function getSkeletonElements(): HTMLElement[] {
+  if (!skeletonContainerRef.value) return []
+  return Array.from(skeletonContainerRef.value.querySelectorAll('[data-skeleton]'))
+}
+
+// 记录卡片当前位置（Flip 动画前置步骤）
+function recordCardPositions(): Map<string, DOMRect> {
+  const positions = new Map<string, DOMRect>()
+  for (const card of getCardElements()) {
+    const id = card.getAttribute('data-card-id')
+    if (id) positions.set(id, card.getBoundingClientRect())
+  }
+  return positions
+}
+
+// 1. 卡片 stagger 入场动画
+function animateCardsEntrance(): void {
+  const cards = getCardElements()
+  if (cards.length === 0) return
+  runMotion(isReduce => {
+    if (isReduce) {
+      gsap.set(cards, { clearProps: 'all' })
+      return
+    }
+    gsap.from(cards, {
+      y: 20,
+      opacity: 0,
+      stagger: 0.06,
+      duration: 0.5,
+      ease: EASE_OUT
+    })
+  })
+}
+
+// 3. Flip 重排动画（从旧位置过渡到新位置）
+function animateFlip(prevPositions: Map<string, DOMRect>): void {
+  const cards = getCardElements()
+  if (cards.length === 0) return
+  runMotion(isReduce => {
+    if (isReduce) {
+      gsap.set(cards, { clearProps: 'all' })
+      return
+    }
+    for (const card of cards) {
+      const id = card.getAttribute('data-card-id')
+      if (!id) continue
+      const prevRect = prevPositions.get(id)
+      if (!prevRect) {
+        // 新出现的卡片：淡入
+        gsap.from(card, { opacity: 0, y: 20, duration: 0.4, ease: EASE_OUT })
+        continue
+      }
+      const newRect = card.getBoundingClientRect()
+      const deltaX = prevRect.left - newRect.left
+      const deltaY = prevRect.top - newRect.top
+      if (deltaX === 0 && deltaY === 0) continue
+      // 从旧位置过渡到新位置
+      gsap.fromTo(
+        card,
+        { x: deltaX, y: deltaY, opacity: 0.5 },
+        { x: 0, y: 0, opacity: 1, duration: 0.4, ease: EASE_OUT, overwrite: 'auto' }
+      )
+    }
+  })
+}
+
+// 2. 骨架屏 shimmer 动画（光泽从左到右扫过）
+function startSkeletonShimmer(): void {
+  const skeletons = getSkeletonElements()
+  if (skeletons.length === 0) return
+  runMotion(isReduce => {
+    if (isReduce) return
+    // 设置渐变背景：中间亮带从左到右扫过
+    gsap.set(skeletons, {
+      backgroundImage:
+        'linear-gradient(90deg, rgba(26,26,46,0.04) 25%, rgba(26,26,46,0.10) 50%, rgba(26,26,46,0.04) 75%)',
+      backgroundSize: '200% 100%'
+    })
+    gsap.fromTo(
+      skeletons,
+      { backgroundPosition: '200% 0' },
+      { backgroundPosition: '-200% 0', duration: 1.5, repeat: -1, ease: 'none' }
+    )
+  })
+}
+
+// 2. 骨架屏淡出 → 真实内容 stagger 淡入（交叉过渡）
+function animateSkeletonToContent(): void {
+  const skeletons = getSkeletonElements()
+  runMotion(isReduce => {
+    if (isReduce) {
+      skeletonVisible.value = false
+      nextTick(() => {
+        animateFilterBarEntrance()
+        animateCardsEntrance()
+      })
+      return
+    }
+    if (skeletons.length > 0) {
+      // 骨架屏淡出，完成后触发卡片入场
+      gsap.to(skeletons, {
+        opacity: 0,
+        duration: 0.3,
+        ease: EASE_OUT,
+        onComplete: () => {
+          skeletonVisible.value = false
+          nextTick(() => {
+            animateFilterBarEntrance()
+            animateCardsEntrance()
+          })
+        }
+      })
+    } else {
+      skeletonVisible.value = false
+      nextTick(() => {
+        animateFilterBarEntrance()
+        animateCardsEntrance()
+      })
+    }
+  })
+}
+
+// 5. 刷新按钮旋转动画（旋转 2 圈 + 回弹）
+function animateRefreshIcon(): void {
+  if (!refreshIconRef.value) return
+  const icon = refreshIconRef.value
+  runMotion(isReduce => {
+    if (isReduce) return
+    gsap.to(icon, {
+      rotation: '+=720',
+      duration: 0.8,
+      ease: EASE_BACK,
+      transformOrigin: 'center center'
+    })
+  })
+}
+
+// 7. Toast 弹性进入动画
+function animateToastIn(): void {
+  if (!toastRef.value) return
+  const el = toastRef.value
+  runMotion(isReduce => {
+    if (isReduce) return
+    gsap.fromTo(
+      el,
+      { y: 20, opacity: 0, scale: 0.9 },
+      { y: 0, opacity: 1, scale: 1, duration: 0.4, ease: EASE_BACK }
+    )
+  })
+}
+
+// 7. Toast 淡出动画
+function animateToastOut(onComplete: () => void): void {
+  if (!toastRef.value) {
+    onComplete()
+    return
+  }
+  const el = toastRef.value
+  runMotion(isReduce => {
+    if (isReduce) {
+      onComplete()
+      return
+    }
+    gsap.to(el, {
+      y: 20,
+      opacity: 0,
+      duration: 0.2,
+      ease: EASE_IN_OUT,
+      onComplete
+    })
+  })
+}
+
+// 8. 筛选器区域入场动画（从上滑入 stagger）
+function animateFilterBarEntrance(): void {
+  if (!filterBarRef.value) return
+  const children = Array.from(filterBarRef.value.children)
+  if (children.length === 0) return
+  runMotion(isReduce => {
+    if (isReduce) return
+    gsap.from(children, {
+      y: -15,
+      opacity: 0,
+      stagger: 0.08,
+      duration: 0.4,
+      ease: EASE_OUT
+    })
+  })
+}
+
+// 4. 删除卡片折叠动画
+function animateCardRemoval(planId: string, onComplete: () => void): void {
+  const cards = getCardElements()
+  const card = cards.find(c => c.getAttribute('data-card-id') === planId)
+  if (!card) {
+    onComplete()
+    return
+  }
+  runMotion(isReduce => {
+    if (isReduce) {
+      onComplete()
+      return
+    }
+    gsap.to(card, {
+      opacity: 0,
+      x: -50,
+      height: 0,
+      marginTop: 0,
+      marginBottom: 0,
+      paddingTop: 0,
+      paddingBottom: 0,
+      duration: 0.4,
+      ease: EASE_OUT,
+      onComplete: () => {
+        gsap.set(card, { clearProps: 'all' })
+        onComplete()
+      }
+    })
+  })
+}
+
+// 6. 标题内联编辑展开动画（从标题位置展开 + 焦点）
+function animateEditExpand(inputEl: HTMLElement): void {
+  runMotion(isReduce => {
+    if (isReduce) {
+      inputEl.focus()
+      return
+    }
+    gsap.fromTo(
+      inputEl,
+      { opacity: 0, scaleX: 0.8, transformOrigin: 'left center' },
+      {
+        opacity: 1,
+        scaleX: 1,
+        duration: 0.25,
+        ease: EASE_OUT,
+        onComplete: () => inputEl.focus()
+      }
+    )
+  })
+}
+
+// === watch 监听 ===
+
+// loading 变化：骨架屏 shimmer 启动 / 骨架屏淡出 + 卡片入场
+watch(loading, (newVal, oldVal) => {
+  if (newVal && !oldVal) {
+    // loading 开始：显示骨架屏并启动 shimmer
+    skeletonVisible.value = true
+    nextTick(() => startSkeletonShimmer())
+  }
+  if (oldVal && !newVal) {
+    // loading 结束：骨架屏淡出 + 卡片 stagger 入场
+    animateSkeletonToContent()
+  }
+})
+
+// filteredPlans 变化：Flip 重排动画（首次渲染跳过，由入场动画处理）
+watch(
+  () => filteredPlans.value.map(p => p.id).join('|'),
+  () => {
+    if (isFirstRender) {
+      isFirstRender = false
+      return
+    }
+    // 记录旧位置（此时 DOM 还未更新）
+    const prevPositions = recordCardPositions()
+    // 等待 DOM 更新后做 Flip 动画
+    nextTick(() => {
+      animateFlip(prevPositions)
+    })
+  }
+)
+
+// toast 变化：弹性进入 / 淡出
+watch(toast, (newVal, oldVal) => {
+  if (newVal && !oldVal) {
+    // 出现：显示并播放弹性进入
+    toastVisible.value = true
+    nextTick(() => animateToastIn())
+  } else if (!newVal && oldVal) {
+    // 消失：播放淡出后隐藏
+    animateToastOut(() => {
+      toastVisible.value = false
+    })
+  }
+})
+
 // 页面挂载：确保 session 后拉取历史行程（命中缓存则直接渲染）
 onMounted(async () => {
   await ensureSession()
+  // 如果正在加载，启动骨架屏 shimmer
+  if (loading.value) {
+    nextTick(() => startSkeletonShimmer())
+  }
   await loadPlans(false)
+  // 缓存命中（loading 一直为 false）：直接触发入场动画
+  // loading 从 true → false 的情况由 watch 处理
+  if (!loading.value && !errorMsg.value && plans.value.length > 0 && !skeletonVisible.value) {
+    nextTick(() => {
+      animateFilterBarEntrance()
+      animateCardsEntrance()
+    })
+  }
+})
+
+// 组件卸载前清理所有 matchMedia 实例
+onBeforeUnmount(() => {
+  mmInstances.forEach(mm => mm.kill())
+  mmInstances.length = 0
 })
 </script>
 
 <template>
-  <div class="min-h-screen relative overflow-hidden">
-    <!-- 装饰背景 -->
-    <div class="pointer-events-none absolute inset-0 overflow-hidden">
-      <div class="absolute -top-20 -left-20 w-72 h-72 rounded-full bg-coral/10 blur-3xl" />
-      <div class="absolute top-40 -right-20 w-80 h-80 rounded-full bg-mint/10 blur-3xl" />
-      <div class="absolute bottom-0 left-1/3 w-64 h-64 rounded-full bg-amber/10 blur-3xl" />
+  <div class="relative max-w-5xl mx-auto px-4 py-8 sm:py-12">
+    <!-- 顶部：标题 + 操作按钮 -->
+    <header class="flex items-start justify-between gap-4 mb-8">
+      <div>
+        <div class="inline-flex items-center gap-2 px-4 py-1.5 rounded-full bg-white shadow-card text-sm font-medium text-coral mb-4">
+          <span class="w-2 h-2 rounded-full bg-coral animate-pulse" />
+          <BookOpen class="w-4 h-4" />
+          我的行程
+        </div>
+        <h1 class="font-display text-3xl sm:text-4xl font-bold text-navy mb-2 leading-tight">
+          我的<span class="text-coral">行程</span>
+        </h1>
+        <p class="text-base text-navy/60">查看你生成过的所有周末计划</p>
+      </div>
+      <div class="flex items-center gap-2 shrink-0">
+        <!-- 刷新按钮：强制重新请求，刷新时图标用 gsap 旋转 -->
+        <BaseButton
+          variant="ghost"
+          size="sm"
+          :disabled="loading"
+          @click="handleRefresh"
+        >
+          <span ref="refreshIconRef" class="inline-flex">
+            <RefreshCw class="w-4 h-4" />
+          </span>
+          刷新
+        </BaseButton>
+      </div>
+    </header>
+
+    <!-- 加载中：骨架屏（gsap shimmer 光泽扫过） -->
+    <div v-if="skeletonVisible" ref="skeletonContainerRef" class="grid sm:grid-cols-2 gap-4">
+      <div
+        v-for="i in 4"
+        :key="i"
+        data-skeleton
+        class="bg-white rounded-2xl p-6 shadow-card"
+      >
+        <div class="flex items-start gap-4">
+          <div class="w-14 h-14 rounded-full bg-navy/10" />
+          <div class="flex-1 space-y-2">
+            <div class="h-5 bg-navy/10 rounded w-3/4" />
+            <div class="h-3 bg-navy/10 rounded w-1/2" />
+            <div class="flex gap-2 pt-1">
+              <div class="h-6 bg-navy/10 rounded-full w-14" />
+              <div class="h-6 bg-navy/10 rounded-full w-14" />
+              <div class="h-6 bg-navy/10 rounded-full w-14" />
+            </div>
+          </div>
+        </div>
+      </div>
     </div>
 
-    <div class="relative max-w-5xl mx-auto px-4 py-8 sm:py-12">
-      <!-- 顶部：标题 + 操作按钮 -->
-      <header class="flex items-start justify-between gap-4 mb-8">
-        <div>
-          <div class="inline-flex items-center gap-2 px-4 py-1.5 rounded-full bg-white shadow-card text-sm font-medium text-coral mb-4">
-            <span class="w-2 h-2 rounded-full bg-coral animate-pulse" />
-            📚 我的行程
-          </div>
-          <h1 class="font-display text-3xl sm:text-4xl font-bold text-navy mb-2 leading-tight">
-            我的<span class="text-coral">行程</span>
-          </h1>
-          <p class="text-base text-navy/60">查看你生成过的所有周末计划</p>
-        </div>
-        <div class="flex items-center gap-2 shrink-0">
-          <!-- 刷新按钮：强制重新请求，刷新时图标旋转 -->
-          <BaseButton
-            variant="ghost"
-            size="sm"
-            :disabled="loading"
-            @click="loadPlans(true)"
-          >
-            <span :class="['inline-block', loading && 'animate-spin']">🔄</span>
-            刷新
-          </BaseButton>
-          <BaseButton variant="ghost" size="sm" @click="goHome">
-            <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2.5" d="M3 12l2-2m0 0l7-7 7 7M5 10v10a1 1 0 001 1h3m10-11l2 2m-2-2v10a1 1 0 01-1 1h-3m-6 0a1 1 0 001-1v-4a1 1 0 011-1h2a1 1 0 011 1v4a1 1 0 001 1m-6 0h6" />
-            </svg>
-            返回首页
-          </BaseButton>
-        </div>
-      </header>
+    <!-- 加载失败 -->
+    <BaseCard v-else-if="errorMsg" padding="lg" class="text-center">
+      <div class="text-5xl mb-3">😵</div>
+      <h2 class="text-lg font-bold text-navy mb-2">加载失败</h2>
+      <p class="text-sm text-navy/60 mb-6">{{ errorMsg }}</p>
+      <BaseButton @click="goHome">返回首页</BaseButton>
+    </BaseCard>
 
-      <!-- 加载中：骨架屏 -->
-      <div v-if="loading" class="grid sm:grid-cols-2 gap-4">
-        <div
-          v-for="i in 4"
-          :key="i"
-          class="bg-white rounded-2xl p-6 shadow-card animate-pulse"
+    <!-- 空状态 -->
+    <BaseCard v-else-if="isEmpty" padding="lg" class="text-center">
+      <MapIcon class="w-16 h-16 mx-auto mb-4 text-coral" />
+      <h2 class="text-xl font-bold text-navy mb-2">还没有行程</h2>
+      <p class="text-navy/50 mb-6">去生成第一个周末计划吧！</p>
+      <BaseButton @click="goHome">🚀 开始规划</BaseButton>
+    </BaseCard>
+
+    <template v-else>
+      <!-- 搜索 + 筛选 + 排序工具栏 -->
+      <div ref="filterBarRef" class="mb-6 space-y-3">
+        <!-- 搜索框 -->
+        <div class="relative">
+          <input
+            v-model="searchQuery"
+            type="text"
+            placeholder="搜索城市或标题..."
+            class="w-full pl-10 pr-9 py-2.5 rounded-xl bg-white shadow-card text-sm text-navy placeholder-navy/30 focus:outline-none focus:ring-2 focus:ring-coral/30 transition"
+          />
+          <svg class="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-navy/30" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z" />
+          </svg>
+          <button
+            v-if="searchQuery"
+            type="button"
+            @click="searchQuery = ''"
+            class="absolute right-3 top-1/2 -translate-y-1/2 text-navy/30 hover:text-navy/60 transition cursor-pointer"
+          >
+            ✕
+          </button>
+        </div>
+
+        <!-- 筛选 + 排序 -->
+        <div class="flex flex-wrap items-center gap-2">
+          <!-- 城市筛选 -->
+          <select
+            v-model="filterCity"
+            class="px-3 py-2 rounded-lg bg-white shadow-card text-sm text-navy focus:outline-none focus:ring-2 focus:ring-coral/30 transition cursor-pointer"
+          >
+            <option value="">🏙️ 全部城市</option>
+            <option v-for="city in availableCities" :key="city" :value="city">{{ city }}</option>
+          </select>
+
+          <!-- 状态筛选 -->
+          <select
+            v-model="filterStatus"
+            class="px-3 py-2 rounded-lg bg-white shadow-card text-sm text-navy focus:outline-none focus:ring-2 focus:ring-coral/30 transition cursor-pointer"
+          >
+            <option value="">📋 全部状态</option>
+            <option value="draft">草稿</option>
+            <option value="active">进行中</option>
+            <option value="completed">已完成</option>
+          </select>
+
+          <!-- 排序字段 -->
+          <select
+            v-model="sortBy"
+            class="px-3 py-2 rounded-lg bg-white shadow-card text-sm text-navy focus:outline-none focus:ring-2 focus:ring-coral/30 transition cursor-pointer"
+          >
+            <option value="created">按创建时间</option>
+            <option value="date">按出行日期</option>
+            <option value="budget">按预算</option>
+            <option value="members">按成员数</option>
+          </select>
+
+          <!-- 排序方向切换 -->
+          <button
+            type="button"
+            @click="toggleSortOrder"
+            class="inline-flex items-center justify-center w-9 h-9 rounded-lg bg-white shadow-card text-sm font-bold text-navy hover:text-coral transition cursor-pointer"
+            :title="sortOrder === 'asc' ? '当前升序，点击切换降序' : '当前降序，点击切换升序'"
+          >
+            {{ sortOrder === 'asc' ? '↑' : '↓' }}
+          </button>
+
+          <!-- 重置筛选 -->
+          <button
+            v-if="hasFilters"
+            type="button"
+            @click="resetFilters"
+            class="inline-flex items-center gap-1 px-3 py-2 rounded-lg text-sm text-navy/50 hover:text-coral transition cursor-pointer"
+          >
+            重置
+          </button>
+        </div>
+      </div>
+
+      <!-- 筛选无结果 -->
+      <BaseCard v-if="filteredPlans.length === 0" padding="lg" class="text-center">
+        <div class="text-5xl mb-3">🔍</div>
+        <h2 class="text-lg font-bold text-navy mb-2">没有匹配的行程</h2>
+        <p class="text-sm text-navy/60 mb-4">试试调整搜索或筛选条件</p>
+        <BaseButton variant="ghost" size="sm" @click="resetFilters">重置筛选</BaseButton>
+      </BaseCard>
+
+      <!-- 行程卡片列表 -->
+      <div v-else ref="cardsContainerRef" class="grid sm:grid-cols-2 gap-4">
+        <BaseCard
+          v-for="plan in filteredPlans"
+          :key="plan.id"
+          :data-card-id="plan.id"
+          v-hover-card
+          padding="md"
+          class="group cursor-pointer"
+          @click="handleCardClick(plan)"
         >
           <div class="flex items-start gap-4">
-            <div class="w-14 h-14 rounded-full bg-navy/10" />
-            <div class="flex-1 space-y-2">
-              <div class="h-5 bg-navy/10 rounded w-3/4" />
-              <div class="h-3 bg-navy/10 rounded w-1/2" />
-              <div class="flex gap-2 pt-1">
-                <div class="h-6 bg-navy/10 rounded-full w-14" />
-                <div class="h-6 bg-navy/10 rounded-full w-14" />
-                <div class="h-6 bg-navy/10 rounded-full w-14" />
-              </div>
+            <!-- 左侧：城市首字图标（hover 时轻微旋转） -->
+            <div class="shrink-0 w-14 h-14 grid place-items-center rounded-full bg-coral text-white text-xl font-bold shadow-md transition-transform duration-300 group-hover:rotate-6">
+              {{ getCityInitial(plan.city) }}
             </div>
-          </div>
-        </div>
-      </div>
 
-      <!-- 加载失败 -->
-      <BaseCard v-else-if="errorMsg" padding="lg" class="text-center">
-        <div class="text-5xl mb-3">😵</div>
-        <h2 class="text-lg font-bold text-navy mb-2">加载失败</h2>
-        <p class="text-sm text-navy/60 mb-6">{{ errorMsg }}</p>
-        <BaseButton @click="goHome">返回首页</BaseButton>
-      </BaseCard>
-
-      <!-- 空状态 -->
-      <BaseCard v-else-if="isEmpty" padding="lg" class="text-center">
-        <div class="text-6xl mb-4">🗺️</div>
-        <h2 class="text-xl font-bold text-navy mb-2">还没有行程</h2>
-        <p class="text-navy/50 mb-6">去生成第一个周末计划吧！</p>
-        <BaseButton @click="goHome">🚀 开始规划</BaseButton>
-      </BaseCard>
-
-      <template v-else>
-        <!-- 搜索 + 筛选 + 排序工具栏 -->
-        <div class="mb-6 space-y-3">
-          <!-- 搜索框 -->
-          <div class="relative">
-            <input
-              v-model="searchQuery"
-              type="text"
-              placeholder="搜索城市或标题..."
-              class="w-full pl-10 pr-9 py-2.5 rounded-xl bg-white shadow-card text-sm text-navy placeholder-navy/30 focus:outline-none focus:ring-2 focus:ring-coral/30 transition"
-            />
-            <svg class="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-navy/30" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z" />
-            </svg>
-            <button
-              v-if="searchQuery"
-              type="button"
-              @click="searchQuery = ''"
-              class="absolute right-3 top-1/2 -translate-y-1/2 text-navy/30 hover:text-navy/60 transition cursor-pointer"
-            >
-              ✕
-            </button>
-          </div>
-
-          <!-- 筛选 + 排序 -->
-          <div class="flex flex-wrap items-center gap-2">
-            <!-- 城市筛选 -->
-            <select
-              v-model="filterCity"
-              class="px-3 py-2 rounded-lg bg-white shadow-card text-sm text-navy focus:outline-none focus:ring-2 focus:ring-coral/30 transition cursor-pointer"
-            >
-              <option value="">🏙️ 全部城市</option>
-              <option v-for="city in availableCities" :key="city" :value="city">{{ city }}</option>
-            </select>
-
-            <!-- 状态筛选 -->
-            <select
-              v-model="filterStatus"
-              class="px-3 py-2 rounded-lg bg-white shadow-card text-sm text-navy focus:outline-none focus:ring-2 focus:ring-coral/30 transition cursor-pointer"
-            >
-              <option value="">📋 全部状态</option>
-              <option value="draft">草稿</option>
-              <option value="active">进行中</option>
-              <option value="completed">已完成</option>
-            </select>
-
-            <!-- 排序字段 -->
-            <select
-              v-model="sortBy"
-              class="px-3 py-2 rounded-lg bg-white shadow-card text-sm text-navy focus:outline-none focus:ring-2 focus:ring-coral/30 transition cursor-pointer"
-            >
-              <option value="created">按创建时间</option>
-              <option value="date">按出行日期</option>
-              <option value="budget">按预算</option>
-              <option value="members">按成员数</option>
-            </select>
-
-            <!-- 排序方向切换 -->
-            <button
-              type="button"
-              @click="toggleSortOrder"
-              class="inline-flex items-center justify-center w-9 h-9 rounded-lg bg-white shadow-card text-sm font-bold text-navy hover:text-coral transition cursor-pointer"
-              :title="sortOrder === 'asc' ? '当前升序，点击切换降序' : '当前降序，点击切换升序'"
-            >
-              {{ sortOrder === 'asc' ? '↑' : '↓' }}
-            </button>
-
-            <!-- 重置筛选 -->
-            <button
-              v-if="hasFilters"
-              type="button"
-              @click="resetFilters"
-              class="inline-flex items-center gap-1 px-3 py-2 rounded-lg text-sm text-navy/50 hover:text-coral transition cursor-pointer"
-            >
-              重置
-            </button>
-          </div>
-        </div>
-
-        <!-- 筛选无结果 -->
-        <BaseCard v-if="filteredPlans.length === 0" padding="lg" class="text-center">
-          <div class="text-5xl mb-3">🔍</div>
-          <h2 class="text-lg font-bold text-navy mb-2">没有匹配的行程</h2>
-          <p class="text-sm text-navy/60 mb-4">试试调整搜索或筛选条件</p>
-          <BaseButton variant="ghost" size="sm" @click="resetFilters">重置筛选</BaseButton>
-        </BaseCard>
-
-        <!-- 行程卡片列表 -->
-        <div v-else class="grid sm:grid-cols-2 gap-4">
-          <BaseCard
-            v-for="plan in filteredPlans"
-            :key="plan.id"
-            padding="md"
-            hover
-            class="group"
-            @click="handleCardClick(plan)"
-          >
-            <div class="flex items-start gap-4">
-              <!-- 左侧：城市首字图标 -->
-              <div class="shrink-0 w-14 h-14 grid place-items-center rounded-full bg-coral text-white text-xl font-bold shadow-md">
-                {{ getCityInitial(plan.city) }}
-              </div>
-
-              <!-- 中部：行程信息 -->
-              <div class="flex-1 min-w-0">
-                <!-- 标题：正常显示或内联编辑 -->
-                <div v-if="editingPlanId === plan.id" class="flex items-center gap-2" @click.stop>
-                  <input
-                    v-model="editingTitle"
-                    type="text"
-                    class="flex-1 min-w-0 px-2 py-1 rounded-lg border border-coral/40 text-sm font-bold text-navy focus:outline-none focus:ring-2 focus:ring-coral/30"
-                    @keyup.enter="saveEdit(plan)"
-                    @keyup.esc="cancelEdit()"
-                  />
-                  <button
-                    type="button"
-                    @click.stop="saveEdit(plan)"
-                    class="shrink-0 w-7 h-7 grid place-items-center rounded-lg bg-mint text-white text-xs hover:bg-mint/90 transition cursor-pointer"
-                    title="保存"
-                  >
-                    ✓
-                  </button>
-                  <button
-                    type="button"
-                    @click.stop="cancelEdit()"
-                    class="shrink-0 w-7 h-7 grid place-items-center rounded-lg bg-navy/10 text-navy/60 text-xs hover:bg-navy/20 transition cursor-pointer"
-                    title="取消"
-                  >
-                    ✕
-                  </button>
-                </div>
-                <h3 v-else class="font-bold text-navy truncate group-hover:text-coral transition-colors">
-                  {{ plan.title || '未命名行程' }}
-                </h3>
-
-                <p class="text-xs text-navy/60 mt-0.5 truncate">
-                  📍 {{ plan.city || '未知城市' }}
-                  <span v-if="plan.date"> · 📅 {{ plan.date }}</span>
-                </p>
-
-                <!-- 标签：时长、预算、人数、已加入 -->
-                <div class="flex flex-wrap gap-1.5 mt-2">
-                  <span class="inline-flex items-center px-2 py-0.5 rounded-full text-xs font-medium bg-mint/10 text-mint">
-                    ⏱ {{ getDurationText(plan) }}
-                  </span>
-                  <span class="inline-flex items-center px-2 py-0.5 rounded-full text-xs font-medium bg-amber/15 text-navy">
-                    💰 ¥{{ plan.budget ?? 0 }}
-                  </span>
-                  <span class="inline-flex items-center px-2 py-0.5 rounded-full text-xs font-medium bg-navy/5 text-navy/60">
-                    👥 {{ plan.people ?? 0 }} 人
-                  </span>
-                  <span class="inline-flex items-center px-2 py-0.5 rounded-full text-xs font-medium bg-coral/10 text-coral">
-                    ✅ 已加入 {{ memberCounts[plan.id] ?? 0 }} 人
-                  </span>
-                </div>
-
-                <!-- 创建时间 -->
-                <p class="text-xs text-navy/40 mt-2">
-                  创建于 {{ formatRelativeTime(plan.created_at) }}
-                </p>
-              </div>
-
-              <!-- 右侧：状态徽章 + 操作 -->
-              <div class="shrink-0 flex flex-col items-end gap-2">
-                <!-- 状态徽章 -->
-                <span
-                  :class="[
-                    'inline-flex items-center px-2 py-0.5 rounded-full text-xs font-semibold',
-                    statusConfig[plan.status]?.bg ?? 'bg-navy/10',
-                    statusConfig[plan.status]?.text ?? 'text-navy/60'
-                  ]"
-                >
-                  {{ statusConfig[plan.status]?.label ?? plan.status }}
-                </span>
-
-                <!-- 操作按钮组 -->
-                <div class="flex items-center gap-1.5">
-                  <!-- 编辑按钮：stop 阻止冒泡触发卡片点击 -->
-                  <button
-                    v-if="editingPlanId !== plan.id"
-                    type="button"
-                    @click.stop="startEdit(plan)"
-                    class="inline-flex items-center justify-center w-8 h-8 rounded-lg text-navy/50 border border-navy/10 hover:border-mint hover:text-mint transition-all duration-200 cursor-pointer"
-                    title="编辑标题"
-                  >
-                    ✏️
-                  </button>
-                  <!-- 删除按钮 -->
-                  <button
-                    type="button"
-                    :disabled="deletingPlanId === plan.id"
-                    @click.stop="handleDelete(plan)"
-                    class="inline-flex items-center justify-center w-8 h-8 rounded-lg text-navy/50 border border-navy/10 hover:border-coral hover:text-coral transition-all duration-200 cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed"
-                    title="删除行程"
-                  >
-                    <span :class="deletingPlanId === plan.id && 'animate-spin'">🗑️</span>
-                  </button>
-                </div>
-
-                <!-- 分享按钮：stop 阻止冒泡触发卡片点击 -->
+            <!-- 中部：行程信息 -->
+            <div class="flex-1 min-w-0">
+              <!-- 标题：正常显示或内联编辑 -->
+              <div v-if="editingPlanId === plan.id" class="flex items-center gap-2" @click.stop>
+                <input
+                  v-model="editingTitle"
+                  type="text"
+                  data-edit-input
+                  class="flex-1 min-w-0 px-2 py-1 rounded-lg border border-coral/40 text-sm font-bold text-navy focus:outline-none focus:ring-2 focus:ring-coral/30"
+                  @keyup.enter="saveEdit(plan)"
+                  @keyup.esc="cancelEdit()"
+                />
                 <button
                   type="button"
-                  @click.stop="handleShare(plan)"
-                  class="inline-flex items-center gap-1 px-2.5 py-1 rounded-lg text-xs font-medium text-navy/60 border border-navy/10 hover:border-coral hover:text-coral transition-all duration-200 cursor-pointer"
+                  @click.stop="saveEdit(plan)"
+                  class="shrink-0 w-7 h-7 grid place-items-center rounded-lg bg-mint text-white text-xs hover:bg-mint/90 transition cursor-pointer"
+                  title="保存"
                 >
-                  <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8.684 13.342C8.886 12.938 9 12.482 9 12c0-.482-.114-.938-.316-1.342m0 2.684a3 3 0 110-2.684m0 2.684l6.632 3.316m-6.632-6l6.632-3.316m0 0a3 3 0 105.367-2.684 3 3 0 00-5.367 2.684zm0 9.316a3 3 0 105.368 2.684 3 3 0 00-5.368-2.684z" />
-                  </svg>
-                  分享
+                  ✓
+                </button>
+                <button
+                  type="button"
+                  @click.stop="cancelEdit()"
+                  class="shrink-0 w-7 h-7 grid place-items-center rounded-lg bg-navy/10 text-navy/60 text-xs hover:bg-navy/20 transition cursor-pointer"
+                  title="取消"
+                >
+                  ✕
                 </button>
               </div>
-            </div>
-          </BaseCard>
-        </div>
-      </template>
-    </div>
+              <h3 v-else class="font-bold text-navy truncate group-hover:text-coral transition-colors">
+                {{ plan.title || '未命名行程' }}
+              </h3>
 
-    <!-- 轻提示 toast -->
-    <Transition
-      enter-active-class="transition-all duration-300 ease-out"
-      leave-active-class="transition-all duration-200 ease-in"
-      enter-from-class="translate-y-4 opacity-0"
-      leave-to-class="translate-y-4 opacity-0"
-    >
-      <div
-        v-if="toast"
-        class="fixed bottom-8 left-1/2 -translate-x-1/2 z-50 px-5 py-2.5 rounded-full bg-navy text-white text-sm font-medium shadow-lg"
-      >
-        {{ toast }}
+              <p class="text-xs text-navy/60 mt-0.5 flex items-center gap-1">
+                <MapPin class="w-3 h-3 shrink-0" />
+                <span class="truncate">{{ plan.city || '未知城市' }}</span>
+                <span v-if="plan.date" class="flex items-center gap-1 shrink-0">
+                  · <Calendar class="w-3 h-3" /> {{ plan.date }}
+                </span>
+              </p>
+
+              <!-- 标签：时长、预算、人数、已加入 -->
+              <div class="flex flex-wrap gap-1.5 mt-2">
+                <span class="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-xs font-medium bg-mint/10 text-mint">
+                  <Clock class="w-3 h-3" />
+                  {{ getDurationText(plan) }}
+                </span>
+                <span class="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-xs font-medium bg-amber/15 text-navy">
+                  <JapaneseYen class="w-3 h-3" />
+                  ¥{{ plan.budget ?? 0 }}
+                </span>
+                <span class="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-xs font-medium bg-navy/5 text-navy/60">
+                  <Users class="w-3 h-3" />
+                  {{ plan.people ?? 0 }} 人
+                </span>
+                <span class="inline-flex items-center px-2 py-0.5 rounded-full text-xs font-medium bg-coral/10 text-coral">
+                  ✅ 已加入 {{ memberCounts[plan.id] ?? 0 }} 人
+                </span>
+              </div>
+
+              <!-- 创建时间 -->
+              <p class="text-xs text-navy/40 mt-2">
+                创建于 {{ formatRelativeTime(plan.created_at) }}
+              </p>
+            </div>
+
+            <!-- 右侧：状态徽章 + 操作 -->
+            <div class="shrink-0 flex flex-col items-end gap-2">
+              <!-- 状态徽章 -->
+              <span
+                :class="[
+                  'inline-flex items-center px-2 py-0.5 rounded-full text-xs font-semibold',
+                  statusConfig[plan.status]?.bg ?? 'bg-navy/10',
+                  statusConfig[plan.status]?.text ?? 'text-navy/60'
+                ]"
+              >
+                {{ statusConfig[plan.status]?.label ?? plan.status }}
+              </span>
+
+              <!-- 操作按钮组 -->
+              <div class="flex items-center gap-1.5">
+                <!-- 编辑按钮：stop 阻止冒泡触发卡片点击 -->
+                <button
+                  v-if="editingPlanId !== plan.id"
+                  type="button"
+                  @click.stop="startEdit(plan)"
+                  class="inline-flex items-center justify-center w-8 h-8 rounded-lg text-navy/50 border border-navy/10 hover:border-mint hover:text-mint transition-all duration-200 cursor-pointer"
+                  title="编辑标题"
+                >
+                  ✏️
+                </button>
+                <!-- 删除按钮 -->
+                <button
+                  type="button"
+                  :disabled="deletingPlanId === plan.id"
+                  @click.stop="handleDelete(plan)"
+                  class="inline-flex items-center justify-center w-8 h-8 rounded-lg text-navy/50 border border-navy/10 hover:border-coral hover:text-coral transition-all duration-200 cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed"
+                  title="删除行程"
+                >
+                  <span :class="deletingPlanId === plan.id && 'animate-spin'">🗑️</span>
+                </button>
+              </div>
+
+              <!-- 分享按钮：stop 阻止冒泡触发卡片点击 -->
+              <button
+                type="button"
+                @click.stop="handleShare(plan)"
+                class="inline-flex items-center gap-1 px-2.5 py-1 rounded-lg text-xs font-medium text-navy/60 border border-navy/10 hover:border-coral hover:text-coral transition-all duration-200 cursor-pointer"
+              >
+                <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8.684 13.342C8.886 12.938 9 12.482 9 12c0-.482-.114-.938-.316-1.342m0 2.684a3 3 0 110-2.684m0 2.684l6.632 3.316m-6.632-6l6.632-3.316m0 0a3 3 0 105.367-2.684 3 3 0 00-5.367 2.684zm0 9.316a3 3 0 105.368 2.684 3 3 0 00-5.368-2.684z" />
+                </svg>
+                分享
+              </button>
+            </div>
+          </div>
+        </BaseCard>
       </div>
-    </Transition>
+    </template>
+
+    <!-- 轻提示 toast（gsap 弹性进入 / 淡出） -->
+    <div
+      v-if="toastVisible"
+      ref="toastRef"
+      class="fixed bottom-8 left-1/2 -translate-x-1/2 z-50 px-5 py-2.5 rounded-full bg-navy text-white text-sm font-medium shadow-lg"
+    >
+      {{ toast }}
+    </div>
 
     <!-- 分享弹窗：复制逻辑由 ShareModal 内部管理 -->
     <ShareModal

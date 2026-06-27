@@ -427,6 +427,10 @@ planRouter.post('/generate', async (req, res) => {
     const createdAt = new Date().toISOString()
     sendSSE(res, 'meta', { planId, createdAt })
 
+    // 总预算保护：Vercel Serverless 函数 60s 超时，留 10s 余量给 enrichment + done + 网络往返
+    const startTime = Date.now()
+    const TOTAL_BUDGET_MS = 50_000
+
     // 2. 异步查询天气（不阻塞主流程）
     let weather: WeatherInfo | undefined
     try {
@@ -477,23 +481,32 @@ planRouter.post('/generate', async (req, res) => {
       })
 
       // 6. 用高德 POI 搜索补充真实坐标，覆盖 AI 编造的坐标
-      if (!closed) {
+      // 总预算保护：若 AI 阶段已用满时间，跳过 enrichment 直接用 AI 坐标发 done
+      const elapsed = Date.now() - startTime
+      const enrichSkipped = elapsed > TOTAL_BUDGET_MS
+      if (enrichSkipped) {
+        console.warn(`总耗时已超 ${TOTAL_BUDGET_MS / 1000}s（实际 ${elapsed}ms），跳过坐标补充以避免 Vercel 超时`)
+      }
+
+      if (!closed && !enrichSkipped) {
         sendSSE(res, 'status', { message: '正在补充地图坐标...' })
       }
       // 先确保所有 item 都有稳定唯一的 id（AI 可能不输出或输出重复 id）
       ensureItemIds(plan)
-      try {
-        await enrichPlanItems(plan, res, () => closed)
-      } catch (err) {
-        // 坐标补充失败不影响主流程，仅打印警告
-        console.warn(
-          '[plan/generate] 坐标补充失败:',
-          err instanceof Error ? err.message : err
-        )
+      if (!enrichSkipped) {
+        try {
+          await enrichPlanItems(plan, res, () => closed)
+        } catch (err) {
+          // 坐标补充失败不影响主流程，仅打印警告
+          console.warn(
+            '[plan/generate] 坐标补充失败:',
+            err instanceof Error ? err.message : err
+          )
+        }
       }
 
       if (!closed) {
-        sendSSE(res, 'done', { plan })
+        sendSSE(res, 'done', { plan, enrichSkipped })
       }
     } catch (err) {
       // JSON 解析失败兜底：返回原始文本作为 chunk，并发送 error 事件

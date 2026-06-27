@@ -3,17 +3,46 @@
 @tailwind utilities;
 
 @layer base {
-  html {
-    scroll-behavior: smooth;
+  /* 平滑滚动仅在支持 hover 的设备（桌面端）启用，移动端不启用 */
+  @media (hover: hover) {
+    html {
+      scroll-behavior: smooth;
+    }
   }
 
   body {
     @apply font-sans bg-cream text-navy antialiased;
     line-height: 1.7;
+    padding-bottom: env(safe-area-inset-bottom);
+  }
+}
+
+/* 尊重用户的减少动画偏好 */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
   }
 }
 
 @layer components {
+  /* 屏幕阅读器专用：视觉隐藏但可被屏幕阅读器读取，用于 aria-live 播报 */
+  .sr-only {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    padding: 0;
+    margin: -1px;
+    overflow: hidden;
+    clip: rect(0, 0, 0, 0);
+    white-space: nowrap;
+    border: 0;
+  }
+
   .btn {
     @apply inline-flex items-center justify-center gap-2 px-6 py-3 rounded-xl font-semibold transition-all duration-300 cursor-pointer border-none;
   }

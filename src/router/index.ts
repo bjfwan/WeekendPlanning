@@ -22,7 +22,8 @@ const router = createRouter({
     {
       path: '/join/:code',
       name: 'join',
-      component: () => import('@/views/JoinView.vue')
+      component: () => import('@/views/JoinView.vue'),
+      meta: { layout: 'centered' as const }
     },
     {
       path: '/history',

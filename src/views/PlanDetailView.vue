@@ -1,6 +1,6 @@
 <script setup lang="ts">
 /** 行程详情页 - 通过分享码加载并展示已保存的行程 */
-import { ref, computed, onMounted, onUnmounted, watch } from 'vue'
+import { ref, computed, onMounted, onUnmounted, defineAsyncComponent, h } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import type { Plan, PlanPreferenceRecord, GeneratePlanRequest, PlanDuration } from '@weekend-planner/shared'
 import { fetchPlanByCode, fetchMembers, fetchMyPlans, subscribeMembers } from '@/composables/useShare'
@@ -11,10 +11,18 @@ import BaseCard from '@/components/BaseCard.vue'
 import ShareModal from '@/components/ShareModal.vue'
 import PlanTimeline from '@/components/PlanTimeline.vue'
 import PlanChecklist from '@/components/PlanChecklist.vue'
-import AmapMap from '@/components/AmapMap.vue'
 import type { MapPoint } from '@/composables/useAmap'
 import type { TransportMode, PlanItem } from '@weekend-planner/shared'
-import { haversineDistance, isValidChinaCoordinate } from '@weekend-planner/shared/utils'
+import { isValidChinaCoordinate } from '@weekend-planner/shared/utils'
+
+// AmapMap 异步加载：减小首屏 chunk，地图组件按需载入
+const AmapMap = defineAsyncComponent({
+  loader: () => import('@/components/AmapMap.vue'),
+  loadingComponent: {
+    name: 'AmapMapLoading',
+    render: () => h('div', { class: 'rounded-2xl bg-cream/60 animate-pulse', style: { minHeight: '300px' } })
+  }
+})
 
 const route = useRoute()
 const router = useRouter()
@@ -45,11 +53,6 @@ const activeDay = ref(0)
 // 路线排序方式：'time' 按时间顺序，'geo' 按地理顺序（默认按地理，后端已重排）
 const routeOrder = ref<'time' | 'geo'>('geo')
 
-// 跨日距离提示：切换日期 tab 时，如果当日起点距上一日终点超过 20km，显示提示
-const crossDayDistance = ref(0)
-const showCrossDayTip = ref(false)
-let crossDayTipTimer: ReturnType<typeof setTimeout> | null = null
-
 // 分享弹窗显示状态
 const shareModalShow = ref(false)
 // 分享链接完整地址
@@ -65,8 +68,6 @@ const currentDay = computed(() => {
   return plan.value.days[activeDay.value] ?? plan.value.days[0]
 })
 
-// 地图组件实例引用（用于调用 focusPoint）
-const amapRef = ref<InstanceType<typeof AmapMap> | null>(null)
 // 时间轴容器引用（用于点击地图标记时定位卡片）
 const timelineRef = ref<HTMLDivElement | null>(null)
 
@@ -113,25 +114,6 @@ const mapPointItemIndices = computed<number[]>(() => {
   return indices
 })
 
-// 跨日连线：上一日最后一个有坐标的 item 坐标
-// 切换日期 tab 时，传给 AmapMap 画一条从上一日终点到当日起点的浅色虚线
-const crossDayPoint = computed<{ lng: number; lat: number } | null>(() => {
-  if (activeDay.value <= 0) return null
-  const prevDay = plan.value?.days[activeDay.value - 1]
-  if (!prevDay) return null
-  // 与当前排序方式保持一致：'time' 用 originalItems，'geo' 用 items
-  const prevItems = routeOrder.value === 'time'
-    ? (prevDay.originalItems ?? prevDay.items)
-    : prevDay.items
-  for (let i = prevItems.length - 1; i >= 0; i--) {
-    const item = prevItems[i]
-    if (isValidChinaCoordinate(item.locationLng, item.locationLat)) {
-      return { lng: item.locationLng as number, lat: item.locationLat as number }
-    }
-  }
-  return null
-})
-
 // 交通方式：优先用生成时保存的 plan.transport，否则默认 mixed
 const mapTransport = computed<TransportMode>(() => plan.value?.transport ?? 'mixed')
 
@@ -144,11 +126,8 @@ function handleResize() {
   windowWidth.value = window.innerWidth
 }
 
-// 当前高亮的卡片元素（用于清理样式）
-let highlightedCard: HTMLElement | null = null
-
 /**
- * 点击地图标记时，滚动到对应的行程卡片并高亮 2 秒
+ * 点击地图标记时，滚动到对应的行程卡片
  */
 function handlePointClick(mapIndex: number) {
   const itemIndex = mapPointItemIndices.value[mapIndex]
@@ -162,112 +141,13 @@ function handlePointClick(mapIndex: number) {
   // PlanItem 卡片根元素
   const card = wrapper.querySelector<HTMLElement>('.bg-white.rounded-2xl.p-5')
   if (!card) return
-
-  // 清除上一个高亮
-  clearHighlight()
-
-  // 滚动到卡片
   card.scrollIntoView({ behavior: 'smooth', block: 'center' })
-
-  // 临时添加高亮样式（ring + scale）
-  card.style.boxShadow = '0 0 0 4px #FF6B6B, 0 8px 20px rgba(255, 107, 107, 0.3)'
-  card.style.transform = 'scale(1.03)'
-  highlightedCard = card
-
-  // 2 秒后移除高亮
-  setTimeout(() => {
-    if (highlightedCard === card) {
-      clearHighlight()
-    }
-  }, 2000)
-}
-
-/** 清除卡片高亮样式 */
-function clearHighlight() {
-  if (highlightedCard) {
-    highlightedCard.style.boxShadow = ''
-    highlightedCard.style.transform = ''
-    highlightedCard = null
-  }
 }
 
 // 切换日期 tab
 function switchDay(idx: number) {
   activeDay.value = idx
 }
-
-/**
- * 获取指定日期 tab 在当前排序方式下的路线 items
- */
-function getDayRouteItems(dayIdx: number): PlanItem[] {
-  if (!plan.value) return []
-  if (dayIdx < 0 || dayIdx >= plan.value.days.length) return []
-  const day = plan.value.days[dayIdx]
-  if (routeOrder.value === 'time') {
-    const original = day.originalItems
-    return original ?? day.items
-  }
-  return day.items
-}
-
-/**
- * 计算当日起点与上一日终点的跨日距离，超过 20km 时显示提示
- */
-function updateCrossDayTip() {
-  showCrossDayTip.value = false
-  crossDayDistance.value = 0
-  if (crossDayTipTimer) {
-    clearTimeout(crossDayTipTimer)
-    crossDayTipTimer = null
-  }
-
-  const dayIdx = activeDay.value
-  if (dayIdx <= 0) return
-
-  const prevItems = getDayRouteItems(dayIdx - 1)
-  const currItems = getDayRouteItems(dayIdx)
-
-  // 上一日最后一个有坐标的 item
-  let prevLast: PlanItem | null = null
-  for (let i = prevItems.length - 1; i >= 0; i--) {
-    if (prevItems[i].locationLng != null && prevItems[i].locationLat != null) {
-      prevLast = prevItems[i]
-      break
-    }
-  }
-  if (!prevLast || prevLast.locationLng == null || prevLast.locationLat == null) return
-
-  // 当日第一个有坐标的 item
-  let currFirst: PlanItem | null = null
-  for (const item of currItems) {
-    if (item.locationLng != null && item.locationLat != null) {
-      currFirst = item
-      break
-    }
-  }
-  if (!currFirst || currFirst.locationLng == null || currFirst.locationLat == null) return
-
-  const dist = haversineDistance(
-    prevLast.locationLng,
-    prevLast.locationLat,
-    currFirst.locationLng,
-    currFirst.locationLat
-  )
-
-  if (dist > 20) {
-    crossDayDistance.value = Math.round(dist)
-    showCrossDayTip.value = true
-    crossDayTipTimer = setTimeout(() => {
-      showCrossDayTip.value = false
-      crossDayTipTimer = null
-    }, 5000)
-  }
-}
-
-// 切换日期 tab 时计算跨日距离提示
-watch(activeDay, () => {
-  updateCrossDayTip()
-})
 
 // 返回上一页，无历史时回到我的行程
 function goBack() {
@@ -310,7 +190,7 @@ function inferDuration(dayCount: number): PlanDuration {
  */
 function handleRegenerate() {
   if (!plan.value || !members.value.length) return
-  // 收集所有成员的偏好去重后作为 interests
+  // 收集所有成员的偏好去重后作为 preferences
   const allPreferences = Array.from(new Set(members.value.flatMap((m) => m.preferences)))
   const request: GeneratePlanRequest = {
     city: plan.value.city,
@@ -318,8 +198,7 @@ function handleRegenerate() {
     duration: inferDuration(plan.value.days.length),
     budget: plan.value.budget,
     people: members.value.length + 1,
-    mood: [],
-    interests: allPreferences,
+    preferences: allPreferences,
     transport: plan.value.transport ?? 'mixed',
     multiUsers: members.value.map((m) => ({
       nickname: m.nickname,
@@ -368,7 +247,6 @@ onMounted(async () => {
 // 离开页面时清理事件监听
 onUnmounted(() => {
   window.removeEventListener('resize', handleResize)
-  if (crossDayTipTimer) clearTimeout(crossDayTipTimer)
   if (unsubscribe) {
     unsubscribe()
     unsubscribe = null
@@ -377,238 +255,217 @@ onUnmounted(() => {
 </script>
 
 <template>
-  <div class="min-h-screen relative overflow-hidden">
-    <!-- 装饰背景 -->
-    <div class="pointer-events-none absolute inset-0 overflow-hidden">
-      <div class="absolute -top-20 -right-20 w-72 h-72 rounded-full bg-mint/10 blur-3xl" />
-      <div class="absolute bottom-20 -left-20 w-80 h-80 rounded-full bg-coral/10 blur-3xl" />
+  <div class="relative max-w-4xl mx-auto px-4 py-8 sm:py-12">
+    <!-- 顶部操作栏 -->
+    <div class="flex items-center justify-between mb-6">
+      <button
+        @click="goBack"
+        class="inline-flex items-center gap-1.5 text-sm font-medium text-navy/60 hover:text-coral transition-colors"
+      >
+        <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+          <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2.5" d="M15 19l-7-7 7-7" />
+        </svg>
+        返回
+      </button>
+      <BaseButton
+        v-if="plan"
+        variant="secondary"
+        size="sm"
+        @click="handleShare"
+      >
+        🔗 分享链接
+      </BaseButton>
     </div>
 
-    <div class="relative max-w-4xl mx-auto px-4 py-8 sm:py-12">
-      <!-- 顶部操作栏 -->
-      <div class="flex items-center justify-between mb-6">
-        <button
-          @click="goBack"
-          class="inline-flex items-center gap-1.5 text-sm font-medium text-navy/60 hover:text-coral transition-colors"
-        >
-          <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2.5" d="M15 19l-7-7 7-7" />
-          </svg>
-          返回
-        </button>
-        <BaseButton
-          v-if="plan"
-          variant="secondary"
-          size="sm"
-          @click="handleShare"
-        >
-          🔗 分享链接
-        </BaseButton>
-      </div>
+    <!-- 加载中 -->
+    <BaseCard v-if="loading" padding="lg" class="text-center">
+      <div class="inline-block w-8 h-8 border-2 border-coral border-t-transparent rounded-full animate-spin mb-3" />
+      <p class="text-sm text-navy/60">正在加载行程信息...</p>
+    </BaseCard>
 
-      <!-- 加载中 -->
-      <BaseCard v-if="loading" padding="lg" class="text-center">
-        <div class="inline-block w-8 h-8 border-2 border-coral border-t-transparent rounded-full animate-spin mb-3" />
-        <p class="text-sm text-navy/60">正在加载行程信息...</p>
+    <!-- 加载失败 -->
+    <div v-else-if="loadError" class="text-center py-16">
+      <div class="text-5xl mb-4">😕</div>
+      <h2 class="text-xl font-bold text-navy mb-2">无法查看行程</h2>
+      <p class="text-navy/50 mb-6">{{ loadError }}</p>
+      <BaseButton @click="router.push({ name: 'home' })">返回首页</BaseButton>
+    </div>
+
+    <!-- 行程展示 -->
+    <div v-else-if="plan" class="space-y-6">
+      <!-- 行程头部 -->
+      <BaseCard padding="lg" class="relative overflow-hidden sm:rounded-3xl">
+        <!-- 装饰渐变背景 -->
+        <div class="pointer-events-none absolute -top-20 -right-16 w-56 h-56 rounded-full bg-coral/10 blur-3xl" />
+        <div class="pointer-events-none absolute -bottom-20 -left-16 w-48 h-48 rounded-full bg-mint/10 blur-3xl" />
+
+        <div class="relative flex flex-wrap items-start justify-between gap-4">
+          <div class="flex-1 min-w-0">
+            <div class="inline-flex items-center gap-1.5 px-3 py-1 rounded-full bg-coral/10 text-coral text-xs font-semibold mb-3">
+              📍 {{ plan.city }}
+            </div>
+            <h1 class="font-display text-2xl sm:text-3xl font-bold text-navy mb-2">
+              {{ plan.title }}
+            </h1>
+            <p class="text-navy/60 leading-relaxed">{{ plan.summary }}</p>
+          </div>
+          <div class="flex flex-col items-end gap-2">
+            <div class="px-4 py-2 rounded-xl bg-navy text-white text-right">
+              <p class="text-xs text-white/60">总花费</p>
+              <p class="text-2xl font-bold text-amber">¥{{ plan.totalCost }}</p>
+            </div>
+            <p class="text-xs text-navy/40">预算 ¥{{ plan.budget }}</p>
+          </div>
+        </div>
+
+        <!-- 天气信息：渐变背景 + 边框 + 更大图标 -->
+        <div
+          v-if="plan.weather"
+          class="relative mt-4 flex items-center gap-4 p-4 rounded-xl bg-gradient-to-r from-mint/10 to-mint/5 border border-mint/20"
+        >
+          <span class="text-3xl shrink-0">🌤️</span>
+          <div class="min-w-0">
+            <p class="text-sm font-semibold text-navy">
+              {{ plan.weather.condition }} · {{ plan.weather.temperature }}
+            </p>
+            <p class="text-xs text-navy/60 mt-0.5">{{ plan.weather.suggestion }}</p>
+          </div>
+        </div>
       </BaseCard>
 
-      <!-- 加载失败 -->
-      <div v-else-if="loadError" class="text-center py-16">
-        <div class="text-5xl mb-4">😕</div>
-        <h2 class="text-xl font-bold text-navy mb-2">无法查看行程</h2>
-        <p class="text-navy/50 mb-6">{{ loadError }}</p>
-        <BaseButton @click="router.push({ name: 'home' })">返回首页</BaseButton>
+      <!-- 已加入的伙伴 -->
+      <BaseCard v-if="members.length" padding="md">
+        <div class="flex items-center justify-between mb-3">
+          <h3 class="font-bold text-navy flex items-center gap-2">
+            <span class="w-8 h-8 grid place-items-center rounded-lg bg-coral/15">👥</span>
+            已加入的伙伴（{{ members.length }}）
+          </h3>
+        </div>
+        <div class="space-y-2">
+          <div
+            v-for="m in members"
+            :key="m.id"
+            class="flex items-center gap-3 p-3 rounded-xl bg-cream/50"
+          >
+            <span class="w-10 h-10 grid place-items-center rounded-full bg-coral text-white text-sm font-bold shrink-0">
+              {{ m.nickname.charAt(0).toUpperCase() }}
+            </span>
+            <div class="flex-1 min-w-0">
+              <p class="text-sm font-semibold text-navy truncate">{{ m.nickname }}</p>
+              <div v-if="m.preferences.length" class="flex flex-wrap gap-1 mt-1">
+                <span
+                  v-for="p in m.preferences"
+                  :key="p"
+                  class="text-xs px-2 py-0.5 rounded-full bg-navy/5 text-navy/60"
+                >
+                  {{ p }}
+                </span>
+              </div>
+            </div>
+          </div>
+        </div>
+        <!-- 基于成员偏好重新生成行程（仅创建者且成员数>0） -->
+        <div v-if="isCreator && members.length > 0" class="mt-4 pt-4 border-t border-navy/5">
+          <BaseButton variant="secondary" class="w-full" @click="handleRegenerate">
+            🔄 基于成员偏好重新生成行程
+          </BaseButton>
+        </div>
+      </BaseCard>
+
+      <!-- 每日行程 -->
+      <div v-if="plan.days.length">
+        <!-- 日期切换 tab -->
+        <div v-if="plan.days.length > 1" class="flex gap-2 mb-4 overflow-x-auto pb-1 -mx-1 px-1">
+          <button
+            v-for="(day, i) in plan.days"
+            :key="i"
+            @click="switchDay(i)"
+            :class="[
+              'shrink-0 px-4 py-2 rounded-xl text-sm font-semibold transition-all duration-200 outline-none',
+              'focus-visible:ring-4 focus-visible:ring-coral/25',
+              activeDay === i
+                ? 'bg-coral text-white shadow-md'
+                : 'bg-white text-navy/60 hover:text-navy shadow-card'
+            ]"
+          >
+            第 {{ day.day }} 天
+          </button>
+        </div>
+
+        <!-- 当日路线地图 -->
+        <div v-if="currentDay" class="mb-4">
+          <div class="flex items-center justify-between gap-3 mb-3">
+            <h3 class="font-bold text-navy flex items-center gap-2">
+              <span class="w-8 h-8 grid place-items-center rounded-lg bg-coral/15">📍</span>
+              当日路线地图
+            </h3>
+            <!-- 路线排序切换：按地理（后端重排）/ 按时间（原始顺序） -->
+            <div class="inline-flex items-center gap-1 p-1 bg-white rounded-xl shadow-card">
+              <button
+                type="button"
+                class="px-3 py-1.5 rounded-lg text-xs font-semibold transition-all duration-200 outline-none border-none"
+                :class="
+                  routeOrder === 'geo'
+                    ? 'bg-coral text-white shadow-sm'
+                    : 'bg-transparent text-navy/60 hover:text-navy hover:bg-cream-dark/30'
+                "
+                @click="routeOrder = 'geo'"
+              >
+                🗺️ 按地理
+              </button>
+              <button
+                type="button"
+                class="px-3 py-1.5 rounded-lg text-xs font-semibold transition-all duration-200 outline-none border-none"
+                :class="
+                  routeOrder === 'time'
+                    ? 'bg-coral text-white shadow-sm'
+                    : 'bg-transparent text-navy/60 hover:text-navy hover:bg-cream-dark/30'
+                "
+                @click="routeOrder = 'time'"
+              >
+                ⏰ 按时间
+              </button>
+            </div>
+          </div>
+          <div class="relative">
+            <AmapMap
+              v-if="mapPoints.length > 0"
+              :points="mapPoints"
+              :transport="mapTransport"
+              :height="mapHeight"
+              :city="plan.city"
+              @point-click="handlePointClick"
+            />
+            <div
+              v-else
+              class="bg-white rounded-2xl p-6 shadow-card text-center text-navy/50 text-sm"
+            >
+              暂无地图数据
+            </div>
+          </div>
+        </div>
+
+        <!-- 时间轴 -->
+        <BaseCard padding="md">
+          <div class="flex items-center justify-between mb-4">
+            <h3 class="font-bold text-navy">
+              第 {{ currentDay?.day }} 天行程
+            </h3>
+            <span v-if="currentDay" class="text-sm text-navy/50">{{ currentDay.date }}</span>
+          </div>
+          <div ref="timelineRef">
+            <PlanTimeline v-if="currentDay" :day="currentDay" :items="routeItems" />
+          </div>
+        </BaseCard>
       </div>
 
-      <!-- 行程展示 -->
-      <div v-else-if="plan" class="space-y-6">
-        <!-- 行程头部 -->
-        <BaseCard padding="lg" class="relative overflow-hidden sm:rounded-3xl">
-          <!-- 装饰渐变背景 -->
-          <div class="pointer-events-none absolute -top-20 -right-16 w-56 h-56 rounded-full bg-coral/10 blur-3xl" />
-          <div class="pointer-events-none absolute -bottom-20 -left-16 w-48 h-48 rounded-full bg-mint/10 blur-3xl" />
-
-          <div class="relative flex flex-wrap items-start justify-between gap-4">
-            <div class="flex-1 min-w-0">
-              <div class="inline-flex items-center gap-1.5 px-3 py-1 rounded-full bg-coral/10 text-coral text-xs font-semibold mb-3">
-                📍 {{ plan.city }}
-              </div>
-              <h1 class="font-display text-2xl sm:text-3xl font-bold text-navy mb-2">
-                {{ plan.title }}
-              </h1>
-              <p class="text-navy/60 leading-relaxed">{{ plan.summary }}</p>
-            </div>
-            <div class="flex flex-col items-end gap-2">
-              <div class="px-4 py-2 rounded-xl bg-navy text-white text-right">
-                <p class="text-xs text-white/60">总花费</p>
-                <p class="text-2xl font-bold text-amber">¥{{ plan.totalCost }}</p>
-              </div>
-              <p class="text-xs text-navy/40">预算 ¥{{ plan.budget }}</p>
-            </div>
-          </div>
-
-          <!-- 天气信息：渐变背景 + 边框 + 更大图标 -->
-          <div
-            v-if="plan.weather"
-            class="relative mt-4 flex items-center gap-4 p-4 rounded-xl bg-gradient-to-r from-mint/10 to-mint/5 border border-mint/20"
-          >
-            <span class="text-3xl shrink-0">🌤️</span>
-            <div class="min-w-0">
-              <p class="text-sm font-semibold text-navy">
-                {{ plan.weather.condition }} · {{ plan.weather.temperature }}
-              </p>
-              <p class="text-xs text-navy/60 mt-0.5">{{ plan.weather.suggestion }}</p>
-            </div>
-          </div>
-        </BaseCard>
-
-        <!-- 已加入的伙伴 -->
-        <BaseCard v-if="members.length" padding="md">
-          <div class="flex items-center justify-between mb-3">
-            <h3 class="font-bold text-navy flex items-center gap-2">
-              <span class="w-8 h-8 grid place-items-center rounded-lg bg-mint/20">👥</span>
-              已加入的伙伴（{{ members.length }}）
-            </h3>
-          </div>
-          <div class="space-y-2">
-            <div
-              v-for="m in members"
-              :key="m.id"
-              class="flex items-center gap-3 p-3 rounded-xl bg-cream/50"
-            >
-              <span class="w-10 h-10 grid place-items-center rounded-full bg-coral text-white text-sm font-bold shrink-0">
-                {{ m.nickname.charAt(0).toUpperCase() }}
-              </span>
-              <div class="flex-1 min-w-0">
-                <p class="text-sm font-semibold text-navy truncate">{{ m.nickname }}</p>
-                <div v-if="m.preferences.length" class="flex flex-wrap gap-1 mt-1">
-                  <span
-                    v-for="p in m.preferences"
-                    :key="p"
-                    class="text-xs px-2 py-0.5 rounded-full bg-navy/5 text-navy/60"
-                  >
-                    {{ p }}
-                  </span>
-                </div>
-              </div>
-            </div>
-          </div>
-          <!-- 基于成员偏好重新生成行程（仅创建者且成员数>0） -->
-          <div v-if="isCreator && members.length > 0" class="mt-4 pt-4 border-t border-navy/5">
-            <BaseButton variant="secondary" class="w-full" @click="handleRegenerate">
-              🔄 基于成员偏好重新生成行程
-            </BaseButton>
-          </div>
-        </BaseCard>
-
-        <!-- 每日行程 -->
-        <div v-if="plan.days.length">
-          <!-- 日期切换 tab -->
-          <div v-if="plan.days.length > 1" class="flex gap-2 mb-4 overflow-x-auto pb-1 -mx-1 px-1">
-            <button
-              v-for="(day, i) in plan.days"
-              :key="i"
-              @click="switchDay(i)"
-              :class="[
-                'shrink-0 px-4 py-2 rounded-xl text-sm font-semibold transition-all duration-200 outline-none',
-                'focus-visible:ring-4 focus-visible:ring-coral/25',
-                activeDay === i
-                  ? 'bg-coral text-white shadow-md'
-                  : 'bg-white text-navy/60 hover:text-navy shadow-card'
-              ]"
-            >
-              第 {{ day.day }} 天
-            </button>
-          </div>
-
-          <!-- 当日路线地图 -->
-          <div v-if="currentDay" class="mb-4">
-            <div class="flex items-center justify-between gap-3 mb-3">
-              <h3 class="font-bold text-navy flex items-center gap-2">
-                <span class="w-8 h-8 grid place-items-center rounded-lg bg-coral/15">📍</span>
-                当日路线地图
-              </h3>
-              <!-- 路线排序切换：按地理（后端重排）/ 按时间（原始顺序） -->
-              <div class="inline-flex items-center gap-1 p-1 bg-white rounded-xl shadow-card">
-                <button
-                  type="button"
-                  class="px-3 py-1.5 rounded-lg text-xs font-semibold transition-all duration-200 outline-none border-none"
-                  :class="
-                    routeOrder === 'geo'
-                      ? 'bg-coral text-white shadow-sm'
-                      : 'bg-transparent text-navy/60 hover:text-navy hover:bg-cream-dark/30'
-                  "
-                  @click="routeOrder = 'geo'"
-                >
-                  🗺️ 按地理
-                </button>
-                <button
-                  type="button"
-                  class="px-3 py-1.5 rounded-lg text-xs font-semibold transition-all duration-200 outline-none border-none"
-                  :class="
-                    routeOrder === 'time'
-                      ? 'bg-coral text-white shadow-sm'
-                      : 'bg-transparent text-navy/60 hover:text-navy hover:bg-cream-dark/30'
-                  "
-                  @click="routeOrder = 'time'"
-                >
-                  ⏰ 按时间
-                </button>
-              </div>
-            </div>
-            <div class="relative">
-              <!-- 跨日距离提示 -->
-              <Transition name="cross-day-tip">
-                <div
-                  v-if="showCrossDayTip"
-                  class="absolute top-2 left-0 right-0 z-20 flex justify-center px-4 pointer-events-none"
-                >
-                  <div class="px-4 py-2 rounded-xl bg-white/95 backdrop-blur shadow-lg border border-coral/20 text-sm font-semibold text-navy whitespace-nowrap">
-                    📍 距上一日终点 {{ crossDayDistance }} km
-                  </div>
-                </div>
-              </Transition>
-              <AmapMap
-                v-if="mapPoints.length > 0"
-                ref="amapRef"
-                :points="mapPoints"
-                :transport="mapTransport"
-                :height="mapHeight"
-                :city="plan.city"
-                :crossDayPoint="crossDayPoint"
-                @point-click="handlePointClick"
-              />
-              <div
-                v-else
-                class="bg-white rounded-2xl p-6 shadow-card text-center text-navy/50 text-sm"
-              >
-                暂无地图数据
-              </div>
-            </div>
-          </div>
-
-          <!-- 时间轴 -->
-          <BaseCard padding="md">
-            <div class="flex items-center justify-between mb-4">
-              <h3 class="font-bold text-navy">
-                第 {{ currentDay?.day }} 天行程
-              </h3>
-              <span v-if="currentDay" class="text-sm text-navy/50">{{ currentDay.date }}</span>
-            </div>
-            <div ref="timelineRef">
-              <PlanTimeline v-if="currentDay" :day="currentDay" :items="routeItems" />
-            </div>
-          </BaseCard>
-        </div>
-
-        <!-- 出行清单 -->
-        <div>
-          <h3 class="font-bold text-navy mb-3 flex items-center gap-2">
-            <span class="w-8 h-8 grid place-items-center rounded-lg bg-amber/20">📋</span>
-            出行准备清单
-          </h3>
-          <PlanChecklist :checklist="plan.checklist" />
-        </div>
+      <!-- 出行清单 -->
+      <div>
+        <h3 class="font-bold text-navy mb-3 flex items-center gap-2">
+          <span class="w-8 h-8 grid place-items-center rounded-lg bg-amber/20">📋</span>
+          出行准备清单
+        </h3>
+        <PlanChecklist :checklist="plan.checklist" />
       </div>
     </div>
 
@@ -622,19 +479,3 @@ onUnmounted(() => {
     />
   </div>
 </template>
-
-<style scoped>
-/* 跨日距离提示：淡入淡出 */
-.cross-day-tip-enter-active {
-  transition: opacity 0.3s ease;
-}
-.cross-day-tip-enter-from {
-  opacity: 0;
-}
-.cross-day-tip-leave-active {
-  transition: opacity 0.3s ease;
-}
-.cross-day-tip-leave-to {
-  opacity: 0;
-}
-</style>

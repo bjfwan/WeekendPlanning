@@ -27,8 +27,7 @@ export interface GeneratePlanRequest {
   duration: PlanDuration
   budget: number
   people: number
-  mood: string[]
-  interests: string[]
+  preferences: string[]
   transport: TransportMode
   multiUsers?: MultiUser[]
   adjustFrom?: string
@@ -151,14 +150,17 @@ export interface PlanRecord {
   duration: PlanDuration
   budget: number
   people: number
-  mood: string[]
-  interests: string[]
+  preferences: string[]
   transport: TransportMode
   plan_data: Plan
   share_code: string | null
   status: 'draft' | 'active' | 'completed'
   created_at: string
   updated_at: string
+  /** 向后兼容旧数据，前端不再写入 */
+  mood?: string[]
+  /** 向后兼容旧数据，前端不再写入 */
+  interests?: string[]
 }
 
 /** plan_preferences 表 */

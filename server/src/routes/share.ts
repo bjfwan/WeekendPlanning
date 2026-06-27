@@ -68,12 +68,11 @@ shareRouter.post('/save', async (req, res) => {
       return
     }
 
-    // 回填生成请求中的字段（Plan 类型本身不包含 duration/people/mood/interests）
+    // 回填生成请求中的字段（Plan 类型本身不包含 duration/people/preferences）
     // request 缺失时从 plan 对象推断兜底值
     const duration: PlanDuration = request?.duration || inferDuration(plan.days.length)
     const people = request?.people ?? 0
-    const mood = request?.mood ?? []
-    const interests = request?.interests ?? []
+    const preferences = request?.preferences ?? []
     const transport = request?.transport || plan.transport || ''
 
     // 生成分享码，冲突时重试（最多 3 次）
@@ -91,8 +90,7 @@ shareRouter.post('/save', async (req, res) => {
           duration,
           budget: plan.budget,
           people,
-          mood,
-          interests,
+          preferences,
           transport,
           plan_data: plan,
           share_code: shareCode,

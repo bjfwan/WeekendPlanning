@@ -18,5 +18,18 @@ export default defineConfig({
         changeOrigin: true
       }
     }
+  },
+  build: {
+    chunkSizeWarningLimit: 1000,
+    rollupOptions: {
+      output: {
+        manualChunks: {
+          'vendor-vue': ['vue', 'vue-router'],
+          'vendor-supabase': ['@supabase/supabase-js'],
+          'vendor-gsap': ['gsap'],
+          'vendor-lucide': ['@lucide/vue']
+        }
+      }
+    }
   }
 })

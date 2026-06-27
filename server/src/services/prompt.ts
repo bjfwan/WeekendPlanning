@@ -35,8 +35,7 @@ export function buildPlanPrompt(
     duration,
     budget,
     people,
-    mood,
-    interests,
+    preferences,
     transport,
     multiUsers,
     adjustFrom
@@ -51,8 +50,7 @@ export function buildPlanPrompt(
   lines.push(`- 行程时长：${DURATION_LABEL[duration]}`)
   lines.push(`- 预算：${budget} 元（人民币）`)
   lines.push(`- 人数：${people} 人`)
-  lines.push(`- 心情/偏好：${mood.join('、') || '不限'}`)
-  lines.push(`- 兴趣方向：${interests.join('、') || '不限'}`)
+  lines.push(`- 偏好：${preferences.join('、') || '不限'}`)
   lines.push(`- 出行方式：${TRANSPORT_LABEL[transport]}`)
 
   // 多人偏好

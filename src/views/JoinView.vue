@@ -22,6 +22,7 @@ import {
   joinPlan,
   subscribeMembers
 } from '@/composables/useShare'
+import { PREFERENCE_OPTIONS } from '@/data/preferences'
 
 const route = useRoute()
 const router = useRouter()
@@ -53,27 +54,9 @@ const joining = ref(false)
 const joinError = ref('')
 // 重新生成中状态
 const regenerating = ref(false)
-// 重新生成错误提示
-const regenerateError = ref('')
 
 // Realtime 订阅取消函数
 let unsubscribe: (() => void) | null = null
-
-// 偏好标签选项
-const preferenceOptions = [
-  { label: '放松', emoji: '😌' },
-  { label: '探险', emoji: '🧗' },
-  { label: '美食', emoji: '🍜' },
-  { label: '文化', emoji: '🏛️' },
-  { label: '浪漫', emoji: '💕' },
-  { label: '亲子', emoji: '👨‍👩‍👧' },
-  { label: '朋友聚会', emoji: '🎉' },
-  { label: '自然风光', emoji: '🌿' },
-  { label: '历史古迹', emoji: '🏯' },
-  { label: '购物', emoji: '🛍️' },
-  { label: '艺术', emoji: '🎨' },
-  { label: '夜生活', emoji: '🌃' }
-]
 
 // 切换偏好标签
 function togglePreference(label: string) {
@@ -110,47 +93,39 @@ async function handleJoin() {
  * 基于成员偏好重新生成行程
  * 将成员列表转换为 multiUsers，结合原 plan 参数调用生成
  */
-async function handleRegenerate() {
+function handleRegenerate() {
   if (!plan.value) return
   regenerating.value = true
-  regenerateError.value = ''
-  try {
-    // 从成员列表转换为 multiUsers 数组
-    const multiUsers: MultiUser[] = members.value.map((m) => ({
-      nickname: m.nickname,
-      preferences: m.preferences
-    }))
+  // 从成员列表转换为 multiUsers 数组
+  const multiUsers: MultiUser[] = members.value.map((m) => ({
+    nickname: m.nickname,
+    preferences: m.preferences
+  }))
 
-    // 优先使用原始请求参数（同一会话中仍保留），否则从 plan 数据重建
-    let request: GeneratePlanRequest
-    if (planRequest.value) {
-      request = { ...planRequest.value, multiUsers }
-    } else {
-      const daysLen = plan.value.days.length
-      const duration: PlanDuration =
-        daysLen >= 3 ? '3-day' : daysLen === 2 ? '2-day' : '1-day'
-      request = {
-        city: plan.value.city,
-        date: plan.value.days[0]?.date || '',
-        duration,
-        budget: plan.value.budget,
-        people: 1,
-        mood: [],
-        interests: [],
-        transport: plan.value.transport ?? 'mixed',
-        multiUsers
-      }
+  // 优先使用原始请求参数（同一会话中仍保留），否则从 plan 数据重建
+  let request: GeneratePlanRequest
+  if (planRequest.value) {
+    request = { ...planRequest.value, multiUsers }
+  } else {
+    const daysLen = plan.value.days.length
+    const duration: PlanDuration =
+      daysLen >= 3 ? '3-day' : daysLen === 2 ? '2-day' : '1-day'
+    request = {
+      city: plan.value.city,
+      date: plan.value.days[0]?.date || '',
+      duration,
+      budget: plan.value.budget,
+      people: 1,
+      preferences: [],
+      transport: plan.value.transport ?? 'mixed',
+      multiUsers
     }
-
-    // 写入共享 planRequest，跳转后 PlanView 会自动调用 generatePlan
-    planRequest.value = request
-    router.push({ name: 'plan' })
-  } catch (err) {
-    regenerateError.value =
-      err instanceof Error ? err.message : '重新生成失败，请稍后重试'
-  } finally {
-    regenerating.value = false
   }
+
+  // 写入共享 planRequest，跳转后 PlanView 会自动调用 generatePlan
+  planRequest.value = request
+  router.push({ name: 'plan' })
+  regenerating.value = false
 }
 
 // 页面挂载：恢复 session 后拉取行程与成员，并订阅实时更新
@@ -195,18 +170,12 @@ onUnmounted(() => {
 </script>
 
 <template>
-  <div class="min-h-screen relative overflow-hidden flex items-center justify-center px-4 py-10">
-    <!-- 装饰背景 -->
-    <div class="pointer-events-none absolute inset-0 overflow-hidden">
-      <div class="absolute -top-20 left-1/4 w-72 h-72 rounded-full bg-amber/10 blur-3xl" />
-      <div class="absolute bottom-0 right-1/4 w-80 h-80 rounded-full bg-mint/10 blur-3xl" />
-    </div>
-
+  <div class="relative flex items-center justify-center px-4 py-10">
     <div class="relative w-full max-w-md">
       <!-- 头部 -->
       <div class="text-center mb-6">
-        <div class="inline-flex items-center gap-2 px-4 py-1.5 rounded-full bg-white shadow-card text-sm font-medium text-mint mb-4">
-          <span class="w-2 h-2 rounded-full bg-mint animate-pulse" />
+        <div class="inline-flex items-center gap-2 px-4 py-1.5 rounded-full bg-white shadow-card text-sm font-medium text-coral mb-4">
+          <span class="w-2 h-2 rounded-full bg-coral animate-pulse" />
           多人协同规划
         </div>
         <h1 class="font-display text-3xl font-bold text-navy mb-2">加入行程协同</h1>
@@ -285,9 +254,6 @@ onUnmounted(() => {
         <!-- 暂无成员提示 -->
         <p v-else class="text-sm text-navy/40 mt-2">暂无成员加入，等待成员通过分享链接加入...</p>
 
-        <!-- 重新生成错误提示 -->
-        <p v-if="regenerateError" class="text-sm text-red-500 mt-3">{{ regenerateError }}</p>
-
         <div class="mt-6 space-y-2">
           <BaseButton
             size="lg"
@@ -297,9 +263,6 @@ onUnmounted(() => {
             @click="handleRegenerate"
           >
             🔄 基于成员偏好重新生成
-          </BaseButton>
-          <BaseButton variant="ghost" size="sm" @click="router.push({ name: 'home' })">
-            返回首页
           </BaseButton>
         </div>
       </BaseCard>
@@ -342,12 +305,6 @@ onUnmounted(() => {
             </div>
           </div>
         </div>
-
-        <div class="mt-6">
-          <BaseButton variant="ghost" size="sm" @click="router.push({ name: 'home' })">
-            返回首页
-          </BaseButton>
-        </div>
       </BaseCard>
 
       <!-- 加入表单 -->
@@ -372,7 +329,7 @@ onUnmounted(() => {
             </label>
             <div class="flex flex-wrap gap-2">
               <BaseTag
-                v-for="opt in preferenceOptions"
+                v-for="opt in PREFERENCE_OPTIONS"
                 :key="opt.label"
                 :emoji="opt.emoji"
                 :selected="preferences.includes(opt.label)"

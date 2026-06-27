@@ -31,23 +31,37 @@ async function amapRequest<T>(path: string, params: Record<string, string>): Pro
   }
   url.searchParams.set('key', config.amap.serverKey)
 
-  const res = await fetch(url.toString(), {
-    method: 'GET',
-    headers: { Accept: 'application/json' }
-  })
+  // 每个请求独立的 AbortController，超时 8s 兜底网络抖动
+  const controller = new AbortController()
+  const timeout = setTimeout(() => controller.abort(), 8000)
 
-  if (!res.ok) {
-    throw new Error(`高德 API 请求失败: HTTP ${res.status}`)
+  try {
+    const res = await fetch(url.toString(), {
+      method: 'GET',
+      headers: { Accept: 'application/json' },
+      signal: controller.signal
+    })
+
+    if (!res.ok) {
+      throw new Error(`高德 API 请求失败: HTTP ${res.status}`)
+    }
+
+    const data = (await res.json()) as T & { status?: string; info?: string; infocode?: string }
+
+    // 高德 API 用 status 字段表示业务是否成功（"1" 成功）
+    if (data.status && data.status !== '1') {
+      throw new Error(`高德 API 业务错误: ${data.info || ''} (${data.infocode || ''})`)
+    }
+
+    return data as T
+  } catch (err) {
+    if (err instanceof Error && err.name === 'AbortError') {
+      throw new Error('高德 API 请求超时（8s）')
+    }
+    throw err
+  } finally {
+    clearTimeout(timeout)
   }
-
-  const data = (await res.json()) as T & { status?: string; info?: string; infocode?: string }
-
-  // 高德 API 用 status 字段表示业务是否成功（"1" 成功）
-  if (data.status && data.status !== '1') {
-    throw new Error(`高德 API 业务错误: ${data.info || ''} (${data.infocode || ''})`)
-  }
-
-  return data as T
 }
 
 /**

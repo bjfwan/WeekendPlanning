@@ -22,10 +22,20 @@ interface FetchPlanResponseData {
 
 /**
  * 通用请求封装：自动解析 JSON 并校验 success 字段
+ * 自动注入 Authorization: Bearer <access_token> 头（未登录时省略，后端走 userId 兜底）
  */
 async function request<T>(url: string, options?: RequestInit): Promise<T> {
+  // 取当前 session 的 access_token；getSession() 从本地缓存读取，开销很小
+  const {
+    data: { session }
+  } = await supabase.auth.getSession()
+  const headers: Record<string, string> = { 'Content-Type': 'application/json' }
+  if (session?.access_token) {
+    headers['Authorization'] = `Bearer ${session.access_token}`
+  }
+
   const res = await fetch(url, {
-    headers: { 'Content-Type': 'application/json' },
+    headers,
     ...options
   })
   if (!res.ok) {
@@ -36,6 +46,17 @@ async function request<T>(url: string, options?: RequestInit): Promise<T> {
     throw new Error(json.error || '请求未成功')
   }
   return json.data as T
+}
+
+/**
+ * 获取当前登录用户 id（未登录返回 undefined）
+ * 用于 DELETE/PUT 接口的 userId 兜底（JWT 校验失败时后端从 body/query 取 userId）
+ */
+async function getCurrentUserId(): Promise<string | undefined> {
+  const {
+    data: { session }
+  } = await supabase.auth.getSession()
+  return session?.user?.id
 }
 
 /**
@@ -111,7 +132,10 @@ export async function fetchMembers(code: string): Promise<PlanPreferenceRecord[]
  * @param code 分享码
  */
 export async function deletePlan(code: string): Promise<void> {
-  await request<{ planId: string }>(`${API_BASE}/api/plan/${code}`, {
+  // 补 userId 兜底：JWT 校验失败时后端从 query 取 userId
+  const userId = await getCurrentUserId()
+  const query = userId ? `?userId=${encodeURIComponent(userId)}` : ''
+  await request<{ planId: string }>(`${API_BASE}/api/plan/${code}${query}`, {
     method: 'DELETE'
   })
 }
@@ -125,9 +149,12 @@ export async function updatePlan(
   code: string,
   updates: { title?: string; status?: string }
 ): Promise<void> {
+  // 补 userId 兜底：JWT 校验失败时后端从 body 取 userId
+  const userId = await getCurrentUserId()
+  const body = { ...updates, ...(userId ? { userId } : {}) }
   await request<{ plan: PlanRecord }>(`${API_BASE}/api/plan/${code}`, {
     method: 'PUT',
-    body: JSON.stringify(updates)
+    body: JSON.stringify(body)
   })
 }
 
